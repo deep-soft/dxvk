@@ -1,5 +1,5 @@
 # 2023-09-17 09:00
-name: Test Builds on Windows
+name: act Build Windows
 
 # on: [push, pull_request, workflow_dispatch]
 on: [workflow_dispatch]
