@@ -53,10 +53,10 @@ jobs:
         type: 'zip'
         filename: '${{ env.TAG_NAME }}-${{ env.VERSION }}-x86.zip'
         directory: 'build-msvc-x86'
-        inclusions: '*.dll'
-        exclusions: '*.map *.pdb'
-        recursive_exclusions: '*.map *.pdb'
-        path: '.'
+        #inclusions: '*.dll'
+        #exclusions: '*.map *.pdb'
+        #recursive_exclusions: '*.map *.pdb'
+        path: '*.dll'
         env_variable: 'ZIP_RELEASE_ARCHIVE_x86'
       # archive name is ${{ env.ZIP_RELEASE_ARCHIVE }}
 
@@ -75,10 +75,10 @@ jobs:
         type: 'zip'
         filename: '${{ env.TAG_NAME }}-${{ env.VERSION }}-x64.zip'
         directory: 'build-msvc-x64'
-        inclusions: '*.dll'
-        exclusions: '*.map *.pdb'
-        recursive_exclusions: '*.map *.pdb'
-        path: '.'
+        #inclusions: '*.dll'
+        #exclusions: '*.map *.pdb'
+        #recursive_exclusions: '*.map *.pdb'
+        path: '*.dll'
         env_variable: 'ZIP_RELEASE_ARCHIVE_x64'
       # archive name is ${{ env.ZIP_RELEASE_ARCHIVE }}
 
