@@ -54,13 +54,16 @@ namespace dxvk {
     /* Far Cry 3: Assumes clear(0.5) on an UNORM  *
      * format to result in 128 on AMD and 127 on  *
      * Nvidia. We assume that the Vulkan drivers  *
-     * match the clear behaviour of D3D11.        */
+     * match the clear behaviour of D3D11.        *
+     * Intel needs to match the AMD result        */
     { R"(\\(farcry3|fc3_blooddragon)_d3d11\.exe$)", {{
       { "dxgi.hideNvidiaGpu",               "False" },
+      { "dxgi.hideIntelGpu",                "True" },
     }} },
-    /* Far Cry 4: Same as Far Cry 3               */
-    { R"(\\FarCry4\.exe$)", {{
+    /* Far Cry 4 and Primal: Same as Far Cry 3    */
+    { R"(\\(FarCry4|FCPrimal)\.exe$)", {{
       { "dxgi.hideNvidiaGpu",               "False" },
+      { "dxgi.hideIntelGpu",                "True" },
     }} },
     /* Frostpunk: Renders one frame with D3D9     *
      * after creating the DXGI swap chain         */
@@ -131,8 +134,8 @@ namespace dxvk {
     { R"(\\vr\.exe$)", {{
       { "d3d11.dcSingleUseMode",            "False" },
     }} },
-    /* Hitman 2 and 3 - requires AGS library      */
-    { R"(\\HITMAN(2|3)\.exe$)", {{
+    /* Hitman 2 - requires AGS library      */
+    { R"(\\HITMAN2\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
     }} },
     /* Modern Warfare Remastered                  */
@@ -422,6 +425,11 @@ namespace dxvk {
     { R"(\\HoloCure\.exe$)", {{
       { "dxgi.useMonitorFallback",          "True" },
     }} },
+    /* Kenshi                                     *
+     * Helps CPU bound performance                */
+    { R"(\\kenshi_x64\.exe$)", {{
+      { "d3d11.cachedDynamicResources",     "v"    },
+    }} },
 
     /**********************************************/
     /* D3D9 GAMES                                 */
@@ -535,11 +543,17 @@ namespace dxvk {
       { "d3d9.customVendorId",              "1002" },
       { "dxgi.emulateUMA",                  "True" },
       { "d3d9.supportDFFormats",            "False" },
-      { "d3d9.deviceLostOnFocusLoss",       "True" },
+      { "d3d9.deviceLossOnFocusLoss",       "True" },
     }} },
-    /* Battlefield 2 (bad z-pass)                 */
+    /* Battlefield 2                              *
+     * Bad z-pass and ingame GUI loss on alt tab  */
     { R"(\\BF2\.exe$)", {{
-      { "d3d9.longMad",                     "True" },
+      { "d3d9.longMad",                     "True" },  
+      { "d3d9.deviceLossOnFocusLoss",       "True" },
+    }} },
+    /* Battlefield 2142 - Same GUI issue as BF2   */
+    { R"(\\BF2142\.exe$)", {{ 
+      { "d3d9.deviceLossOnFocusLoss",       "True" },
     }} },
     /* SpellForce 2 Series                        */
     { R"(\\SpellForce2.*\.exe$)", {{
@@ -568,7 +582,7 @@ namespace dxvk {
       { "d3d9.customDeviceId",              "0402" },
     }} },
     /* Warhammer: Online                         */
-    { R"(\\WAR(-64)?\.exe$)", {{
+    { R"(\\(WAR(-64)?|WARTEST(-64)?)\.exe$)", {{
       { "d3d9.customVendorId",              "1002" },
     }} },
     /* Dragon Nest                               */
@@ -784,7 +798,7 @@ namespace dxvk {
     /* DC Universe Online                      *
      * Freezes after alt tabbing               */
     { R"(\\DCGAME\.EXE$)", {{
-      { "d3d9.deviceLostOnFocusLoss",       "True" },
+      { "d3d9.deviceLossOnFocusLoss",       "True" },
     }} },
     /* Halo Online                             *
      * Black textures                          */
@@ -833,6 +847,20 @@ namespace dxvk {
     { R"(\\SkyDrift\.exe$)" , {{
       { "d3d9.allowDirectBufferMapping",    "False" },
     }} },
+     /* Assassin's Creed 2                      *
+     *  Helps alt tab crash on Linux            */
+    { R"(\\AssassinsCreedIIGame\.exe$)" , {{
+      { "d3d9.deviceLossOnFocusLoss",       "True" },
+    }} },
+    /* Sonic CD                                */
+    { R"(\\soniccd\.exe$)", {{
+      { "d3d9.maxFrameRate",                "60" },
+    }} },
+    /* UK Truck Simulator 1                    */
+    { R"(\\UK Truck Simulator\\bin\\win_x86\\game\.exe$)", {{
+      { "d3d9.floatEmulation",              "Strict" },
+    }} },
+    
 
     /**********************************************/
     /* D3D12 GAMES (vkd3d-proton with dxvk dxgi)  */
@@ -862,6 +890,16 @@ namespace dxvk {
      * optimization of that function is in Proton. */
     { R"(\\Cyberpunk2077\.exe$)", {{
       { "dxgi.useMonitorFallback",          "True" },
+    }} },
+    /* Hitman 3 - Ray Tracing                      */
+    { R"(\\HITMAN3\.exe$)", {{
+      { "dxgi.hideNvidiaGpu",              "False" },
+    }} },
+    /* Metro Exodus Enhanced Edition picks GPU adapters
+     * by available VRAM, which causes issues on some
+     * systems with integrated graphics. */
+    { R"(\\Metro Exodus Enhanced Edition\\MetroExodus\.exe$)", {{
+      { "dxvk.hideIntegratedGraphics",      "True" },
     }} },
   }};
 
