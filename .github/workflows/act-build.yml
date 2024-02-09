@@ -15,7 +15,7 @@ jobs:
     steps:
     - name: Checkout code
       id: checkout-code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: recursive
 
@@ -104,7 +104,7 @@ jobs:
 
     - name: Publish
       continue-on-error: true
-      uses: deep-soft/action-gh-release@v1
+      uses: deep-soft/action-gh-release@v2.1
       with:
         tag_name: ${{ env.TAG_NAME }}-${{ env.VERSION }}
         files: |
