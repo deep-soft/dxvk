@@ -793,6 +793,7 @@ namespace dxvk {
     void SynchronizeCsThread(uint64_t SequenceNumber);
 
     void Flush();
+    void FlushAndSync9On12();
 
     void EndFrame();
 
@@ -1059,6 +1060,9 @@ namespace dxvk {
       return std::exchange(m_deviceHasBeenReset, false);
     }
 
+    template <bool Synchronize9On12>
+    void ExecuteFlush();
+
     void DetermineConstantLayouts(bool canSWVP);
 
     D3D9BufferSlice AllocUPBuffer(VkDeviceSize size);
@@ -1241,6 +1245,34 @@ namespace dxvk {
 
     uint64_t GetCurrentSequenceNumber();
 
+    /**
+     * @brief Get the swapchain that was used the most recently for presenting
+     * Has to be externally synchronized.
+     * 
+     * @return D3D9SwapChainEx* Swapchain
+     */
+    D3D9SwapChainEx* GetMostRecentlyUsedSwapchain() {
+      return m_mostRecentlyUsedSwapchain;
+    }
+
+    /**
+     * @brief Set the swapchain that was used the most recently for presenting
+     * Has to be externally synchronized.
+     * 
+     * @param swapchain Swapchain
+     */
+    void SetMostRecentlyUsedSwapchain(D3D9SwapChainEx* swapchain) {
+      m_mostRecentlyUsedSwapchain = swapchain;
+    }
+
+    /**
+     * @brief Reset the most recently swapchain back to the implicit one
+     * Has to be externally synchronized.
+     */
+    void ResetMostRecentlyUsedSwapchain() {
+      m_mostRecentlyUsedSwapchain = m_implicitSwapchain.ptr();
+    }
+
     Com<D3D9InterfaceEx>            m_parent;
     D3DDEVTYPE                      m_deviceType;
     HWND                            m_window;
@@ -1393,6 +1425,8 @@ namespace dxvk {
 
     Rc<sync::Fence>                 m_submissionFence;
     uint64_t                        m_submissionId = 0ull;
+    DxvkSubmitStatus                m_submitStatus;
+
     uint64_t                        m_flushSeqNum = 0ull;
     GpuFlushTracker                 m_flushTracker;
 
@@ -1402,6 +1436,8 @@ namespace dxvk {
     D3D9DeviceLostState             m_deviceLostState          = D3D9DeviceLostState::Ok;
     HWND                            m_fullscreenWindow         = NULL;
     std::atomic<uint32_t>           m_losableResourceCounter   = { 0 };
+
+    D3D9SwapChainEx*                m_mostRecentlyUsedSwapchain = nullptr;
 
 #ifdef D3D9_ALLOW_UNMAPPING
     lru_list<D3D9CommonTexture*>    m_mappedTextures;
