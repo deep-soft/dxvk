@@ -29,18 +29,30 @@ namespace dxvk {
 
       return refCount + 1;
     }
-    
-    ULONG STDMETHODCALLTYPE Release() {
-      // ignore Release calls on objects with 0 refCount
-      if(unlikely(!this->m_refCount))
-        return this->m_refCount;
 
-      uint32_t refCount = --this->m_refCount;
+    ULONG STDMETHODCALLTYPE Release() {
+      uint32_t oldRefCount, refCount;
+
+      do {
+        oldRefCount = this->m_refCount.load(std::memory_order_acquire);
+
+        // clamp value to 0 to prevent underruns
+        if (unlikely(!oldRefCount))
+          return 0;
+
+        refCount = oldRefCount - 1;
+
+      } while (!this->m_refCount.compare_exchange_weak(oldRefCount,
+                                                       refCount,
+                                                       std::memory_order_release,
+                                                       std::memory_order_acquire));
+
       if (unlikely(!refCount)) {
         auto* pDevice = GetDevice();
         this->ReleasePrivate();
         pDevice->Release();
       }
+
       return refCount;
     }
 
@@ -51,6 +63,7 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
 
       *ppDevice = ref(GetDevice());
+
       return D3D_OK;
     }
 
@@ -64,7 +77,7 @@ namespace dxvk {
 
   protected:
 
-    D3D8Device* m_parent;
+    D3D8Device* m_parent = nullptr;
 
   };
 

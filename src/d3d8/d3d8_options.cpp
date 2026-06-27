@@ -1,4 +1,5 @@
 #include "d3d8_options.h"
+
 #include "../d3d9/d3d9_bridge.h"
 #include "../util/config/config.h"
 #include "../util/util_string.h"
@@ -6,8 +7,9 @@
 #include <charconv>
 
 namespace dxvk {
+
   static inline uint32_t parseDword(std::string_view str) {
-    uint32_t value = UINT32_MAX;
+    uint32_t value = std::numeric_limits<uint32_t>::max();
     std::from_chars(str.data(), str.data() + str.size(), value);
     return value;
   }
@@ -50,6 +52,18 @@ namespace dxvk {
 
       forceVsDecl.emplace_back(D3DVSDE_REGISTER(reg), D3DVSDT_TYPE(type));
     }
-
   }
+
+  D3D8Options::D3D8Options(const Config& config) {
+    auto forceVsDeclStr           = config.getOption<std::string>("d3d8.forceVsDecl",             "");
+
+    this->batching                = config.getOption<bool>       ("d3d8.batching",                false);
+    this->placeP8InScratch        = config.getOption<bool>       ("d3d8.placeP8InScratch",        false);
+    this->forceLegacyDiscard      = config.getOption<bool>       ("d3d8.forceLegacyDiscard",      false);
+    this->shadowPerspectiveDivide = config.getOption<bool>       ("d3d8.shadowPerspectiveDivide", false);
+    this->textureUAFGuard         = config.getOption<bool>       ("d3d8.textureUAFGuard",         false);
+
+    parseVsDecl(forceVsDeclStr);
+  }
+
 }

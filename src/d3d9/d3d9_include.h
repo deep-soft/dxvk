@@ -44,16 +44,14 @@
 #define D3DPRESENT_FORCEIMMEDIATE              0x00000100L
 #endif
 
-#ifndef D3DSWAPEFFECT_COPY_VSYNC
-#define D3DSWAPEFFECT_COPY_VSYNC 4
-#endif
-
-// MinGW headers are broken. Who'dve guessed?
+// Missing in some versions of mingw headers
 #ifndef _MSC_VER
-typedef struct _D3DDEVINFO_RESOURCEMANAGER
-{
-  char dummy;
-} D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+namespace dxvk {
+  typedef struct _D3DDEVINFO_RESOURCEMANAGER
+  {
+    char dummy;
+  } D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+}
 #endif
 
 // This is the managed pool on D3D9Ex, it's just hidden!
@@ -104,4 +102,9 @@ IDirect3DDevice9On12 : public IUnknown {
 #ifndef _MSC_VER
 __CRT_UUID_DECL(IDirect3DDevice9On12,      0xe7fda234,0xb589,0x4049,0x94,0x0d,0x88,0x78,0x97,0x75,0x31,0xc8);
 #endif
+
+enum class D3D9ShaderType : uint16_t {
+  VertexShader = 0,
+  PixelShader  = 1,
+};
 

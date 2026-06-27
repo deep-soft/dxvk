@@ -1,4 +1,3 @@
-
 #include "d3d8_shader.h"
 
 #define VSD_SHIFT_MASK(token, field) ((token & field ## MASK) >> field ## SHIFT)
@@ -12,7 +11,7 @@
 
 namespace dxvk {
 
-  static constexpr int D3D8_NUM_VERTEX_INPUT_REGISTERS = 17;
+  static constexpr uint32_t D3D8_NUM_VERTEX_INPUT_REGISTERS = 17;
 
   /**
    * Standard mapping of vertex input registers v0-v16 to D3D9 usages and usage indices
@@ -86,14 +85,14 @@ namespace dxvk {
    */
   constexpr DWORD encodeDestRegister(d3d9::D3DSHADER_PARAM_REGISTER_TYPE type, UINT reg) {
     DWORD token = 0;
-    token    |= reg & 0x7FF;                  // bits 0:10   num
-    token    |= ((type & 0x07) << 28);        // bits 28:30  type[0:2]
-    token    |= ((type & 0x18) >>  3) << 11;  // bits 11:12  type[3:4]
-    // UINT addrMode : 1;                     // bit  13     hasRelative
-    token    |= 0b1111 << 16;                 // bits 16:19  DxsoRegMask
-    // UINT resultModifier : 3;               // bits 20:23
-    // UINT resultShift : 3;                  // bits 24:27
-    token    |= 1 << 31;                      // bit  31     always 1
+    token |= reg & 0x7FF;                  // bits 0:10   num
+    token |= ((type & 0x07) << 28);        // bits 28:30  type[0:2]
+    token |= ((type & 0x18) >>  3) << 11;  // bits 11:12  type[3:4]
+    // UINT addrMode : 1;                  // bit  13     hasRelative
+    token |= 0b1111 << 16;                 // bits 16:19  DxsoRegMask
+    // UINT resultModifier : 3;            // bits 20:23
+    // UINT resultShift : 3;               // bits 24:27
+    token |= 1u << 31;                     // bit  31     always 1
     return token;
   }
 
@@ -106,39 +105,39 @@ namespace dxvk {
     DWORD token = 0;
     token |= VSD_ENCODE(usage, D3DSP_DCL_USAGE);       // bits 0:4   DxsoUsage (TODO: missing MSB)
     token |= VSD_ENCODE(index, D3DSP_DCL_USAGEINDEX);  // bits 16:19 usageIndex
-    token |= 1 << 31;                                  // bit 31     always 1
+    token |= 1u << 31;                                 // bit 31     always 1
     return token;
   }
 
   /**
-   * Converts a D3D8 vertex shader + declaration
-   * to a D3D9 vertex shader + declaration.
+   * Validates and converts a D3D8 vertex shader
+   * + declaration to a D3D9 vertex shader + declaration.
   */
-  D3D9VertexShaderCode TranslateVertexShader8(
-      const DWORD*        pDeclaration,
-      const DWORD*        pFunction,
-      const D3D8Options&  options) {
+  HRESULT TranslateVertexShader8(
+      const DWORD*          pDeclaration,
+      const DWORD*          pFunction,
+      const D3D8Options&    options,
+      D3D9VertexShaderCode& pTranslatedVS) {
     using d3d9::D3DDECLTYPE;
     using d3d9::D3DDECLTYPE_UNUSED;
 
-    D3D9VertexShaderCode result;
+    HRESULT res = D3D_OK;
 
-    std::vector<DWORD>& tokens = result.function;
     std::vector<DWORD> defs; // Constant definitions
 
     // shaderInputRegisters:
     // set bit N to enable input register vN
     DWORD shaderInputRegisters = 0;
 
-    d3d9::D3DVERTEXELEMENT9* vertexElements = result.declaration;
-    unsigned int elementIdx = 0;
+    d3d9::D3DVERTEXELEMENT9* vertexElements = pTranslatedVS.declaration;
+    uint32_t elementIdx = 0;
 
     // These are used for pDeclaration and pFunction
-    int i = 0;
+    uint32_t i = 0;
     DWORD token;
 
     std::stringstream dbg;
-    dbg << "Vertex Declaration Tokens:\n\t";
+    dbg << "D3D8: Vertex Declaration Tokens:\n\t";
 
     WORD currentStream = 0;
     WORD currentOffset = 0;
@@ -207,6 +206,12 @@ namespace dxvk {
             D3DVSDT_TYPE     type = D3DVSDT_TYPE(VSD_SHIFT_MASK(token, D3DVSD_DATATYPE));
             D3DVSDE_REGISTER reg  = D3DVSDE_REGISTER(VSD_SHIFT_MASK(token, D3DVSD_VERTEXREG));
 
+            // FVF normals are expected to only have 3 components
+            if (unlikely(pFunction == nullptr && reg == D3DVSDE_NORMAL && type != D3DVSDT_FLOAT3)) {
+              Logger::err("D3D8Device::CreateVertexShader: Invalid FVF declaration: D3DVSDE_NORMAL must use D3DVSDT_FLOAT3");
+              return D3DERR_INVALIDCALL;
+            }
+
             addVertexElement(reg, type);
 
             dbg << "type=" << type << ", register=" << reg;
@@ -230,10 +235,10 @@ namespace dxvk {
           dbg << "count=" << count << ", addr=" << addr << ", rs=" << rs;
 
           // Add a DEF instruction for each constant
-          for (DWORD j = 0; j < regCount; j += 4) {
+          for (uint32_t j = 0; j < regCount; j += 4) {
             defs.push_back(encodeInstruction(d3d9::D3DSIO_DEF));
             defs.push_back(encodeDestRegister(d3d9::D3DSPR_CONST2, addr));
-            defs.push_back(pDeclaration[i+j+0]);
+            defs.push_back(pDeclaration[i+j]);
             defs.push_back(pDeclaration[i+j+1]);
             defs.push_back(pDeclaration[i+j+2]);
             defs.push_back(pDeclaration[i+j+3]);
@@ -273,6 +278,8 @@ namespace dxvk {
     }
 
     if (pFunction != nullptr) {
+      std::vector<DWORD>& tokens = pTranslatedVS.function;
+
       // Copy first token (version)
       tokens.push_back(pFunction[0]);
 
@@ -281,7 +288,7 @@ namespace dxvk {
       Logger::debug(str::format("VS version: ", vsMajor, ".", vsMinor));
 
       // Insert dcl instructions
-      for (int vn = 0; vn < D3D8_NUM_VERTEX_INPUT_REGISTERS; vn++) {
+      for (UINT vn = 0; vn < D3D8_NUM_VERTEX_INPUT_REGISTERS; vn++) {
 
         // If bit N is set then we need to dcl register vN
         if ((shaderInputRegisters & (1 << vn)) != 0) {
@@ -313,8 +320,10 @@ namespace dxvk {
         // Instructions
         if ((token & VS_BIT_PARAM) == 0) {
 
-          // RSQ swizzle fixup
-          if (opcode == D3DSIO_RSQ) {
+          // Swizzle fixup for opcodes that require explicit use of a replicate swizzle.
+          if (opcode == D3DSIO_RSQ  || opcode == D3DSIO_RCP
+           || opcode == D3DSIO_EXP  || opcode == D3DSIO_LOG
+           || opcode == D3DSIO_EXPP || opcode == D3DSIO_LOGP) {
             tokens.push_back(token);                            // instr
             tokens.push_back(token = pFunction[i++]);           // dest
             token = pFunction[i++];                             // src0
@@ -331,6 +340,7 @@ namespace dxvk {
       } while (token != D3DVS_END());
     }
 
-    return result;
+    return res;
   }
+
 }

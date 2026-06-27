@@ -12,6 +12,9 @@ namespace dxvk::wsi {
 #if defined(DXVK_WSI_WIN32)
     &Win32WSI,
 #endif
+#if defined(DXVK_WSI_SDL3)
+    &Sdl3WSI,
+#endif
 #if defined(DXVK_WSI_SDL2)
     &Sdl2WSI,
 #endif
@@ -77,11 +80,26 @@ namespace dxvk::wsi {
     s_driver->resizeWindow(hWindow, pState, width, height);
   }
 
+  void saveWindowState(
+          HWND             hWindow,
+          DxvkWindowState* pState,
+          bool             saveStyle) {
+    s_driver->saveWindowState(hWindow, pState, saveStyle);
+  }
+
+  void restoreWindowState(
+          HWND             hWindow,
+          DxvkWindowState* pState,
+          bool             restoreCoordinates) {
+    s_driver->restoreWindowState(hWindow, pState, restoreCoordinates);
+  }
+
   bool setWindowMode(
           HMONITOR         hMonitor,
           HWND             hWindow,
+          DxvkWindowState* pState,
     const WsiMode&         mode) {
-    return s_driver->setWindowMode(hMonitor, hWindow, mode);
+    return s_driver->setWindowMode(hMonitor, hWindow, pState, mode);
   }
 
   bool enterFullscreenMode(
@@ -95,9 +113,8 @@ namespace dxvk::wsi {
 
   bool leaveFullscreenMode(
           HWND             hWindow,
-          DxvkWindowState* pState,
-          bool             restoreCoordinates) {
-    return s_driver->leaveFullscreenMode(hWindow, pState, restoreCoordinates);
+          DxvkWindowState* pState) {
+    return s_driver->leaveFullscreenMode(hWindow, pState);
   }
 
   bool restoreDisplayMode() {

@@ -110,16 +110,22 @@ namespace dxvk {
     // Not supported but exist
     AI44 = MAKEFOURCC('A', 'I', '4', '4'),
     IA44 = MAKEFOURCC('I', 'A', '4', '4'),
+    CENT = MAKEFOURCC('C', 'E', 'N', 'T'),
     R2VB = MAKEFOURCC('R', '2', 'V', 'B'),
     COPM = MAKEFOURCC('C', 'O', 'P', 'M'),
     SSAA = MAKEFOURCC('S', 'S', 'A', 'A'),
-    AL16 = MAKEFOURCC('A', 'L', '1', '6'),
-    R16  = MAKEFOURCC(' ', 'R', '1', '6'),
+    NVCS = MAKEFOURCC('N', 'V', 'C', 'S'),
+    NVHS = MAKEFOURCC('N', 'V', 'H', 'S'),
+    NVHU = MAKEFOURCC('N', 'V', 'H', 'U'),
 
     EXT1 = MAKEFOURCC('E', 'X', 'T', '1'),
     FXT1 = MAKEFOURCC('F', 'X', 'T', '1'),
     GXT1 = MAKEFOURCC('G', 'X', 'T', '1'),
     HXT1 = MAKEFOURCC('H', 'X', 'T', '1'),
+    AL16 = MAKEFOURCC('A', 'L', '1', '6'),
+    AR16 = MAKEFOURCC('A', 'R', '1', '6'),
+    R16  = MAKEFOURCC(' ', 'R', '1', '6'),
+    L16_FOURCC = MAKEFOURCC(' ', 'L', '1', '6'),
   };
 
   inline D3D9Format EnumerateFormat(D3DFORMAT format) {
@@ -147,9 +153,15 @@ namespace dxvk {
     VkFormat             FormatSrgb     = VK_FORMAT_UNDEFINED;
   };
 
+  struct D3D9_FORMAT_BLOCK_SIZE {
+    uint8_t            Width  = 0;
+    uint8_t            Height = 0;
+    uint8_t            Depth  = 0;
+  };
+
   /**
    * \brief Format mapping
-   * 
+   *
    * Maps a D3D9 format to a set of Vulkan formats.
    */
   struct D3D9_VK_FORMAT_MAPPING {
@@ -171,6 +183,10 @@ namespace dxvk {
 
   D3D9_VK_FORMAT_MAPPING ConvertFormatUnfixed(D3D9Format Format);
 
+  D3D9_FORMAT_BLOCK_SIZE GetFormatAlignedBlockSize(D3D9Format Format);
+
+  class D3D9Adapter;
+
   /**
    * \brief Format table
    *
@@ -183,6 +199,7 @@ namespace dxvk {
   public:
 
     D3D9VkFormatTable(
+            D3D9Adapter*     pParent,
       const Rc<DxvkAdapter>& adapter,
       const D3D9Options&     options);
 
@@ -205,19 +222,28 @@ namespace dxvk {
     const DxvkFormatInfo* GetUnsupportedFormatInfo(
       D3D9Format            Format) const;
 
+    void RefreshFormatSupport(
+      const D3D9Adapter*          pParent);
+
   private:
 
     bool CheckImageFormatSupport(
       const Rc<DxvkAdapter>&      Adapter,
-      VkFormat              Format,
-      VkFormatFeatureFlags2 Features) const;
+            VkFormat              Format,
+            VkFormatFeatureFlags2 Features) const;
+
+    bool m_isExtended;
 
     bool m_d24s8Support;
     bool m_d16s8Support;
 
     bool m_dfSupport;
     bool m_x4r4g4b4Support;
+    bool m_w11v11u10Support;
     bool m_d16lockableSupport;
+
+    bool m_d32flockableSupport;
+    bool m_d24fs8Support;
   };
 
   inline bool IsFourCCFormat(D3D9Format format) {
@@ -237,6 +263,53 @@ namespace dxvk {
       && format != D3D9Format::DXT3
       && format != D3D9Format::DXT4
       && format != D3D9Format::DXT5;
+  }
+
+  inline bool IsDXTFormat(D3D9Format format) {
+    return format == D3D9Format::DXT1
+        || format == D3D9Format::DXT2
+        || format == D3D9Format::DXT3
+        || format == D3D9Format::DXT4
+        || format == D3D9Format::DXT5;
+  }
+
+  // D3D9 documentation says: IDirect3DSurface9::GetDC is valid on the following formats only:
+  // D3DFMT_R5G6B5, D3DFMT_X1R5G5B5, D3DFMT_R8G8B8, and D3DFMT_X8R8G8B8. However,
+  // the equivalent formats of D3DFMT_A1R5G5B5 and D3DFMT_A8R8G8B8 are also supported.
+  inline bool IsSurfaceGetDCCompatibleFormat(D3D9Format format) {
+    return format == D3D9Format::R5G6B5
+        || format == D3D9Format::X1R5G5B5
+        || format == D3D9Format::A1R5G5B5
+        || format == D3D9Format::R8G8B8
+        || format == D3D9Format::X8R8G8B8
+        || format == D3D9Format::A8R8G8B8;
+  }
+
+  inline bool IsDepthFormat(D3D9Format Format) {
+    return Format == D3D9Format::D16_LOCKABLE
+        || Format == D3D9Format::D32
+        || Format == D3D9Format::D15S1
+        || Format == D3D9Format::D24S8
+        || Format == D3D9Format::D24X8
+        || Format == D3D9Format::D24X4S4
+        || Format == D3D9Format::D16
+        || Format == D3D9Format::D32F_LOCKABLE
+        || Format == D3D9Format::D24FS8
+        || Format == D3D9Format::D32_LOCKABLE
+        || Format == D3D9Format::DF16
+        || Format == D3D9Format::DF24
+        || Format == D3D9Format::INTZ;
+  }
+
+  inline bool IsDepthStencilFormat(D3D9Format Format) {
+    return IsDepthFormat(Format) || Format == D3D9Format::S8_LOCKABLE;
+  }
+
+  inline bool IsLockableDepthStencilFormat(D3D9Format Format) {
+    return Format == D3D9Format::S8_LOCKABLE
+        || Format == D3D9Format::D16_LOCKABLE
+        || Format == D3D9Format::D32_LOCKABLE
+        || Format == D3D9Format::D32F_LOCKABLE;
   }
 
 }

@@ -11,126 +11,63 @@
 namespace dxvk {
 
   /**
-   * \brief Texture coordinates
+   * \brief Resolve mode for multisampled blits
    */
-  struct DxvkMetaBlitOffset {
-    float x, y, z;
+  enum class DxvkMetaBlitResolveMode : uint32_t {
+    FilterNearest     = 0u,
+    FilterLinear      = 1u,
+    ResolveAverage    = 2u,
   };
-  
+
   /**
-   * \brief Push constant data
-   */
-  struct DxvkMetaBlitPushConstants {
-    DxvkMetaBlitOffset srcCoord0;
-    uint32_t           pad1;
-    DxvkMetaBlitOffset srcCoord1;
-    uint32_t           layerCount;
-  };
-  
-  /**
-   * \brief Blit pipeline key
-   * 
-   * We have to create pipelines for each
-   * combination of source image view type
-   * and image format.
-   */
-  struct DxvkMetaBlitPipelineKey {
-    VkImageViewType       viewType;
-    VkFormat              viewFormat;
-    VkSampleCountFlagBits samples;
-    
-    bool eq(const DxvkMetaBlitPipelineKey& other) const {
-      return this->viewType   == other.viewType
-          && this->viewFormat == other.viewFormat
-          && this->samples    == other.samples;
-    }
-    
-    size_t hash() const {
-      DxvkHashState result;
-      result.add(uint32_t(this->viewType));
-      result.add(uint32_t(this->viewFormat));
-      result.add(uint32_t(this->samples));
-      return result;
-    }
-  };
-  
-  /**
-   * \brief Blit render pass key
-   */
-  struct DxvkMetaBlitRenderPassKey {
-    VkFormat              viewFormat;
-    VkSampleCountFlagBits samples;
-    
-    bool eq(const DxvkMetaBlitRenderPassKey& other) const {
-      return this->viewFormat == other.viewFormat
-          && this->samples    == other.samples;
-    }
-    
-    size_t hash() const {
-      DxvkHashState result;
-      result.add(uint32_t(this->viewFormat));
-      result.add(uint32_t(this->samples));
-      return result;
-    }
-  };
-  
-  /**
-   * \brief Blit pipeline
-   * 
-   * Stores the objects for a single pipeline
-   * that is used for blitting.
-   */
-  struct DxvkMetaBlitPipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeHandle;
-  };
-  
-  
-  /**
-   * \brief Blit render pass
+   * \brief Meta blit pipeline
    *
-   * Stores image view, render pass and framebuffer
-   * objects for a blit operation, as well as some
-   * metadata.
+   * Used for all sorts of different 2D operations that cannot be
+   * modeled as regular copies, resolves or Vulkan blits. A very
+   * common use case includes blits involving mutlisampled images.
    */
-  class DxvkMetaBlitRenderPass : public DxvkResource {
+  struct DxvkMetaBlit {
+    /** Shader arguments for blit pipeline */
+    struct Args {
+      VkOffset3D srcCoord0 = { 0, 0, 0 };
+      VkOffset3D srcCoord1 = { 0, 0, 0 };
+      uint32_t sampler = 0u;
+      uint32_t layerIndex = 0u;
+      uint32_t layerCount = 0u;
+    };
 
-  public:
+    /** Look-up info for blit pipeline */
+    struct Key {
+      VkImageViewType         srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat                dstFormat   = VK_FORMAT_UNDEFINED;
+      VkSampleCountFlagBits   dstSamples  = VK_SAMPLE_COUNT_1_BIT;
+      VkSampleCountFlagBits   srcSamples  = VK_SAMPLE_COUNT_1_BIT;
+      DxvkMetaBlitResolveMode resolveMode = DxvkMetaBlitResolveMode::FilterNearest;
 
-    DxvkMetaBlitRenderPass(
-      const Rc<DxvkDevice>&       device,
-      const Rc<DxvkImage>&        dstImage,
-      const Rc<DxvkImage>&        srcImage,
-      const VkImageBlit&          region,
-      const VkComponentMapping&   mapping);
+      bool eq(const Key& other) const {
+        return srcViewType  == other.srcViewType
+            && dstFormat    == other.dstFormat
+            && dstSamples   == other.dstSamples
+            && srcSamples   == other.srcSamples
+            && resolveMode  == other.resolveMode;
+      }
 
-    ~DxvkMetaBlitRenderPass();
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(srcViewType));
+        hash.add(uint32_t(dstFormat));
+        hash.add(uint32_t(dstSamples));
+        hash.add(uint32_t(srcSamples));
+        hash.add(uint32_t(resolveMode));
+        return hash;
+      }
+    };
 
-    VkImageViewType viewType() const;
-
-    uint32_t framebufferLayerIndex() const;
-    uint32_t framebufferLayerCount() const;
-
-    VkImageView getDstView() const { return m_dstView; }
-    VkImageView getSrcView() const { return m_srcView; }
-
-  private:
-
-    Rc<vk::DeviceFn>  m_vkd;
-    Rc<DxvkImage>     m_dstImage;
-    Rc<DxvkImage>     m_srcImage;
-
-    VkImageBlit       m_region;
-    VkImageView       m_dstView;
-    VkImageView       m_srcView;
-
-    VkImageView createDstView();
-    VkImageView createSrcView(const VkComponentMapping& mapping);
-
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;;
   };
-
   
+
   /**
    * \brief Blitter objects
    * 
@@ -143,72 +80,59 @@ namespace dxvk {
     
   public:
     
-    DxvkMetaBlitObjects(const DxvkDevice* device);
+    DxvkMetaBlitObjects(DxvkDevice* device);
+
     ~DxvkMetaBlitObjects();
     
     /**
      * \brief Creates a blit pipeline
      * 
-     * \param [in] viewType Source image view type
-     * \param [in] viewFormat Image view format
-     * \param [in] samples Target sample count
+     * \param [in] key Pipeline properties
      * \returns The blit pipeline
      */
-    DxvkMetaBlitPipeline getPipeline(
-            VkImageViewType       viewType,
-            VkFormat              viewFormat,
-            VkSampleCountFlagBits samples);
-    
-    /**
-     * \brief Retrieves sampler with a given filter
-     *
-     * \param [in] filter The desired filter
-     * \returns Sampler object with the given filter
-     */
-    VkSampler getSampler(
-            VkFilter              filter);
-    
+    DxvkMetaBlit getPipeline(const DxvkMetaBlit::Key& key);
+
   private:
-    
-    Rc<vk::DeviceFn>  m_vkd;
-    
-    VkSampler m_samplerCopy;
-    VkSampler m_samplerBlit;
-    
-    VkShaderModule m_shaderVert   = VK_NULL_HANDLE;
-    VkShaderModule m_shaderGeom   = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag1D = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag2D = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag3D = VK_NULL_HANDLE;
-    
+
+    DxvkDevice* m_device = nullptr;
+
     dxvk::mutex m_mutex;
-    
-    std::unordered_map<
-      DxvkMetaBlitPipelineKey,
-      DxvkMetaBlitPipeline,
-      DxvkHash, DxvkEq> m_pipelines;
-    
-    VkSampler createSampler(
-            VkFilter                    filter) const;
-    
-    VkShaderModule createShaderModule(
-      const SpirvCodeBuffer&            code) const;
-    
-    DxvkMetaBlitPipeline createPipeline(
-      const DxvkMetaBlitPipelineKey&    key);
-    
-    VkDescriptorSetLayout createDescriptorSetLayout(
-            VkImageViewType             viewType) const;
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout       descriptorSetLayout) const;
-    
-    VkPipeline createPipeline(
-            VkPipelineLayout            pipelineLayout,
-            VkImageViewType             imageViewType,
-            VkFormat                    format,
-            VkSampleCountFlagBits       samples) const;
-    
+
+    std::unordered_map<DxvkMetaBlit::Key, DxvkMetaBlit, DxvkHash, DxvkEq> m_pipelines;
+
+    struct SampleProperties {
+      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+      uint32_t scaleX = 1u;
+      uint32_t scaleY = 1u;
+      uint64_t mapping = 0u;
+    };
+
+    const DxvkPipelineLayout* createPipelineLayout() const;
+
+    std::vector<uint32_t> createVs(
+      const DxvkMetaBlit::Key&          key,
+            VkImageAspectFlagBits       aspect,
+      const DxvkPipelineLayout*         layout);
+
+    std::vector<uint32_t> createPsSimple(
+      const DxvkMetaBlit::Key&          key,
+            VkImageAspectFlagBits       aspect,
+      const DxvkPipelineLayout*         layout);
+
+    std::vector<uint32_t> createPsResolve(
+      const DxvkMetaBlit::Key&          key,
+            VkImageAspectFlagBits       aspect,
+      const DxvkPipelineLayout*         layout);
+
+    std::vector<uint32_t> createPsSampleMs(
+      const DxvkMetaBlit::Key&          key,
+            VkImageAspectFlagBits       aspect,
+      const DxvkPipelineLayout*         layout);
+
+    DxvkMetaBlit createPipeline(const DxvkMetaBlit::Key& key);
+
+    static std::string getName(const DxvkMetaBlit::Key& key, const char* type);
+
   };
-  
+
 }

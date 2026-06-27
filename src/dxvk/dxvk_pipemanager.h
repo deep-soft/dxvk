@@ -7,7 +7,6 @@
 
 #include "dxvk_compute.h"
 #include "dxvk_graphics.h"
-#include "dxvk_state_cache.h"
 
 namespace dxvk {
 
@@ -224,6 +223,24 @@ namespace dxvk {
       const DxvkGraphicsPipelineFragmentOutputState& state);
 
     /**
+     * \brief Creates a descriptor set layout
+     *
+     * \param [in] key Descriptor set layout key
+     * \returns Descriptor set layout object
+     */
+    const DxvkDescriptorSetLayout* createDescriptorSetLayout(
+      const DxvkDescriptorSetLayoutKey& key);
+
+    /**
+     * \brief Creates a pipeline layout
+     *
+     * \param [in] key Pipeline layout key
+     * \returns Descriptor set layout object
+     */
+    const DxvkPipelineLayout* createPipelineLayout(
+      const DxvkPipelineLayoutKey& key);
+
+    /**
      * \brief Registers a shader
      * 
      * Starts compiling pipelines asynchronously
@@ -260,6 +277,14 @@ namespace dxvk {
     }
 
     /**
+     * \brief Queries descriptor layout for spec data UBO
+     * \returns Descriptor set layout with an inline UBO
+     */
+    VkDescriptorSetLayout getSpecDataSetLayout() const {
+      return m_specLayout;
+    }
+
+    /**
      * \brief Stops async compiler threads
      */
     void stopWorkerThreads();
@@ -268,20 +293,23 @@ namespace dxvk {
     
     DxvkDevice*               m_device;
     DxvkPipelineWorkers       m_workers;
-    DxvkStateCache            m_stateCache;
     DxvkPipelineStats         m_stats;
-    
-    dxvk::mutex m_mutex;
-    
+
+    VkDescriptorSetLayout     m_specLayout = VK_NULL_HANDLE;
+
+    dxvk::mutex               m_layoutMutex;
+
     std::unordered_map<
-      DxvkBindingSetLayoutKey,
-      DxvkBindingSetLayout,
+      DxvkDescriptorSetLayoutKey,
+      DxvkDescriptorSetLayout,
       DxvkHash, DxvkEq> m_descriptorSetLayouts;
 
     std::unordered_map<
-      DxvkBindingLayout,
-      DxvkBindingLayoutObjects,
+      DxvkPipelineLayoutKey,
+      DxvkPipelineLayout,
       DxvkHash, DxvkEq> m_pipelineLayouts;
+
+    dxvk::mutex m_pipelineMutex;
 
     std::unordered_map<
       DxvkGraphicsPipelineVertexInputState,
@@ -308,12 +336,6 @@ namespace dxvk {
       DxvkGraphicsPipeline,
       DxvkHash, DxvkEq> m_graphicsPipelines;
 
-    DxvkBindingSetLayout* createDescriptorSetLayout(
-      const DxvkBindingSetLayoutKey& key);
-
-    DxvkBindingLayoutObjects* createPipelineLayout(
-      const DxvkBindingLayout& layout);
-
     DxvkShaderPipelineLibrary* createPipelineLibraryLocked(
       const DxvkShaderPipelineLibraryKey& key);
 
@@ -325,8 +347,7 @@ namespace dxvk {
     DxvkShaderPipelineLibrary* findPipelineLibraryLocked(
       const DxvkShaderPipelineLibraryKey& key);
 
-    bool canPrecompileShader(
-      const Rc<DxvkShader>& shader) const;
+    VkDescriptorSetLayout createSpecDataSetLayout();
 
   };
   

@@ -51,12 +51,6 @@ namespace dxvk {
       return m_view;
     }
     
-    VkImageLayout GetRenderLayout() const {
-      return m_view->image()->info().tiling == VK_IMAGE_TILING_OPTIMAL
-        ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-        : VK_IMAGE_LAYOUT_GENERAL;
-    }
-
     UINT GetSampleCount() const {
       return UINT(m_view->image()->info().sampleCount);
     }
@@ -87,7 +81,9 @@ namespace dxvk {
     D3D11_VK_VIEW_INFO                m_info;
     Rc<DxvkImageView>                 m_view;
     D3D10RenderTargetView             m_d3d10;
-    
+
+    D3DDestructionNotifier            m_destructionNotifier;
+
   };
   
 }

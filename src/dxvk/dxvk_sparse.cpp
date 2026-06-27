@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <sstream>
 
 #include "dxvk_buffer.h"
@@ -6,6 +7,30 @@
 #include "dxvk_sparse.h"
 
 namespace dxvk {
+
+  std::atomic<uint64_t> DxvkPagedResource::s_cookie = { 0u };
+
+
+  DxvkPagedResource::~DxvkPagedResource() {
+
+  }
+
+
+  void DxvkPagedResource::makeResourceResident() {
+    m_allocator->requestMakeResident(this);
+  }
+
+
+  DxvkResourceRef::~DxvkResourceRef() {
+    auto resource = reinterpret_cast<DxvkPagedResource*>(m_ptr & ~AccessMask);
+    auto access = DxvkAccess(m_ptr & AccessMask);
+
+    if (access != DxvkAccess::Move)
+      resource->requestResidency();
+
+    resource->release(access);
+  }
+
 
   DxvkSparseMapping::DxvkSparseMapping()
   : m_pool(nullptr),
@@ -395,7 +420,7 @@ namespace dxvk {
           DxvkSparseMapping&&     mapping) {
     if (m_mappings[page] != mapping) {
       if (m_mappings[page])
-        cmd->trackResource<DxvkAccess::None>(m_mappings[page].m_page);
+        cmd->track(m_mappings[page].m_page);
 
       m_mappings[page] = std::move(mapping);
     }

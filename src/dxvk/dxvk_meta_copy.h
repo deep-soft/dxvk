@@ -8,108 +8,243 @@
 #include "dxvk_barrier.h"
 #include "dxvk_cmdlist.h"
 #include "dxvk_hash.h"
-#include "dxvk_resource.h"
 
 namespace dxvk {
 
   class DxvkDevice;
 
   /**
-   * \brief Push constants for buffer image copies
+   * \brief Image-to-image copy pipeline
+   *
+   * The use case for these pipelines is to implement copies between color
+   * and depth images on devices that do not support maintenance8, as well
+   * as depth-stencil copies on older AMD drivers where the native copy is
+   * inefficient.
    */
-  struct DxvkCopyBufferImageArgs {
-    VkOffset3D dstOffset; uint32_t pad0;
-    VkOffset3D srcOffset; uint32_t pad1;
-    VkExtent3D extent;    uint32_t pad2;
-    VkExtent2D dstSize;
-    VkExtent2D srcSize;
+  struct DxvkMetaImageCopy {
+    /** Shader args for image to image copies */
+    struct Args {
+      VkOffset3D srcOffset  = { };
+      VkExtent3D srcExtent  = { };
+      uint32_t   layerIndex = 0u;
+      uint32_t   stencilBit = 0u;
+    };
+
+    /** Look-up key for image copy pipelines */
+    struct Key {
+      VkImageViewType srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+      VkImageAspectFlags dstAspects = 0u;
+      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+      VkBool32 bitwiseStencil = VK_FALSE;
+
+      bool eq(const Key& other) const {
+        return srcViewType    == other.srcViewType
+            && dstFormat      == other.dstFormat
+            && dstAspects     == other.dstAspects
+            && samples        == other.samples
+            && bitwiseStencil == other.bitwiseStencil;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(srcViewType));
+        hash.add(uint32_t(dstFormat));
+        hash.add(uint32_t(dstAspects));
+        hash.add(uint32_t(samples));
+        hash.add(uint32_t(bitwiseStencil));
+        return hash;
+      }
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
   };
+
+
+  /**
+   * \brief Input attachment to image copy pipeline
+   */
+  struct DxvkMetaInputAttachmentImageCopy {
+    /** Shader args for image to image copies */
+    struct Args {
+      VkOffset2D srcOffset  = { };
+      VkOffset2D dstOffset  = { };
+      uint32_t srcLayer = { };
+      uint32_t dstLayer = { };
+    };
+
+    /** Look-up key for input attachment copy pipelines */
+    struct Key {
+      VkImageViewType srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkImageViewType dstViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+      uint32_t srcAttachment = 0u;
+      std::array<VkFormat, MaxNumRenderTargets> colorFormats = { };
+      VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+
+      bool eq(const Key& other) const {
+        bool result = srcViewType   == other.srcViewType
+                   && dstViewType   == other.dstViewType
+                   && dstFormat     == other.dstFormat
+                   && srcAttachment == other.srcAttachment;
+
+        for (uint32_t i = 0u; i < MaxNumRenderTargets; i++)
+          result = result && colorFormats[i] == other.colorFormats[i];
+
+        result = result && depthFormat == other.depthFormat;
+        return result;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(srcViewType));
+        hash.add(uint32_t(dstViewType));
+        hash.add(uint32_t(dstFormat));
+        hash.add(uint32_t(srcAttachment));
+        for (uint32_t i = 0u; i < MaxNumRenderTargets; i++)
+          hash.add(uint32_t(colorFormats[i]));
+        hash.add(uint32_t(depthFormat));
+        return hash;
+      }
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+  };
+
+
+  /**
+   * \brief Buffer-to-image copy pipeline
+   *
+   * The primary use case for these pipelines is to support interleaved
+   * depth-stencil uploads, as well as moving data to multisampled images
+   * for legacy APIs. Uses a single texel buffer to copy from.
+   */
+  struct DxvkMetaBufferToImageCopy {
+    /** Shader args for buffer to image copies */
+    struct Args {
+      VkOffset3D srcOffset = { };
+      VkExtent2D srcExtent = { };
+      VkExtent3D dstExtent = { };
+      uint32_t   layerIndex = 0u;
+      uint32_t   stencilBit = 0u;
+    };
+
+    /** Look-up key for copy pipelines */
+    struct Key {
+      VkImageViewType dstViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat srcFormat = VK_FORMAT_UNDEFINED;
+      VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+      VkFormat bufferFormat = VK_FORMAT_UNDEFINED;
+      VkImageAspectFlags dstAspects = 0u;
+      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+      VkBool32 bitwiseStencil = VK_FALSE;
+
+      bool eq(const Key& other) const {
+        return dstViewType    == other.dstViewType
+            && srcFormat      == other.srcFormat
+            && dstFormat      == other.dstFormat
+            && bufferFormat   == other.bufferFormat
+            && dstAspects     == other.dstAspects
+            && samples        == other.samples
+            && bitwiseStencil == other.bitwiseStencil;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(dstViewType));
+        hash.add(uint32_t(dstFormat));
+        hash.add(uint32_t(dstAspects));
+        hash.add(uint32_t(srcFormat));
+        hash.add(uint32_t(bufferFormat));
+        hash.add(uint32_t(samples));
+        hash.add(uint32_t(bitwiseStencil));
+        return hash;
+      }
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+  };
+
+
+  /**
+   * \brief Image to buffer copy pipeline
+   *
+   * Used primarily to write out interleaved depth-stencil
+   * data to buffers.
+   */
+  struct DxvkMetaImageToBufferCopy {
+    /** Shader args for buffer to image copies */
+    struct Args {
+      VkOffset3D dstOffset = { };
+      VkExtent2D dstExtent = { };
+      VkOffset3D srcOffset = { };
+      VkExtent3D srcExtent = { };
+    };
+
+    /** Look-up key for copy pipelines */
+    struct Key {
+      VkImageViewType srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat srcFormat = VK_FORMAT_UNDEFINED;
+      VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+
+      bool eq(const Key& other) const {
+        return srcViewType    == other.srcViewType
+            && srcFormat      == other.srcFormat
+            && dstFormat      == other.dstFormat;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(srcViewType));
+        hash.add(uint32_t(srcFormat));
+        hash.add(uint32_t(dstFormat));
+        return hash;
+      }
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkExtent3D workgroupSize = { };
+  };
+
+
+  /**
+   * \brief Packed buffer image copy pipeline
+   *
+   * Used to copy data between images that that are stored
+   * as buffers in memory.
+   */
+  struct DxvkMetaPackedBufferImageCopy {
+    /** Look-up key. Currently empty because there only needs to
+     *  be one variant of the pipeline with the current setup. */
+    struct Key { };
+
+    /** Shader args for packed buffer image copies */
+    struct Args {
+      VkOffset3D dstOffset = { };
+      VkExtent2D dstLayout = { };
+      VkOffset3D srcOffset = { };
+      VkExtent2D srcLayout = { };
+      VkExtent3D extent = { };
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkExtent3D workgroupSize = { };
+  };
+
 
   /**
    * \brief Pair of view formats for copy operation
    */
   struct DxvkMetaCopyFormats {
-    VkFormat dstFormat;
-    VkFormat srcFormat;
+    VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+    VkFormat srcFormat = VK_FORMAT_UNDEFINED;
   };
 
-  /**
-   * \brief Copy pipeline
-   * 
-   * Stores the objects for a single pipeline
-   * that is used for fragment shader copies.
-   */
-  struct DxvkMetaCopyPipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeHandle;
-  };
-
-  /**
-   * \brief Copy pipeline key
-   * 
-   * Used to look up copy pipelines based
-   * on the copy operation they support.
-   */
-  struct DxvkMetaCopyPipelineKey {
-    VkImageViewType       viewType;
-    VkFormat              format;
-    VkSampleCountFlagBits samples;
-
-    bool eq(const DxvkMetaCopyPipelineKey& other) const {
-      return this->viewType == other.viewType
-          && this->format   == other.format
-          && this->samples  == other.samples;
-    }
-
-    size_t hash() const {
-      return (uint32_t(format)  << 8)
-           ^ (uint32_t(samples) << 4)
-           ^ (uint32_t(viewType));
-    }
-  };
-
-  /**
-   * \brief Copy view objects
-   * 
-   * Creates and manages views used in a
-   * framebuffer-based copy operations.
-   */
-  class DxvkMetaCopyViews : public DxvkResource {
-
-  public:
-
-    DxvkMetaCopyViews(
-      const Rc<vk::DeviceFn>&         vkd,
-      const Rc<DxvkImage>&            dstImage,
-      const VkImageSubresourceLayers& dstSubresources,
-            VkFormat                  dstFormat,
-      const Rc<DxvkImage>&            srcImage,
-      const VkImageSubresourceLayers& srcSubresources,
-            VkFormat                  srcFormat);
-    
-    ~DxvkMetaCopyViews();
-
-    VkImageView getDstView() const { return m_dstImageView; }
-    VkImageView getSrcView() const { return m_srcImageView; }
-    VkImageView getSrcStencilView() const { return m_srcStencilView; }
-
-    VkImageViewType getSrcViewType() const {
-      return m_srcViewType;
-    }
-
-  private:
-
-    Rc<vk::DeviceFn>  m_vkd;
-
-    VkImageViewType   m_srcViewType     = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    VkImageViewType   m_dstViewType     = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-
-    VkImageView       m_dstImageView    = VK_NULL_HANDLE;
-    VkImageView       m_srcImageView    = VK_NULL_HANDLE;
-    VkImageView       m_srcStencilView  = VK_NULL_HANDLE;
-
-  };
 
   /**
    * \brief Meta copy objects
@@ -121,8 +256,48 @@ namespace dxvk {
 
   public:
 
-    DxvkMetaCopyObjects(const DxvkDevice* device);
+    DxvkMetaCopyObjects(DxvkDevice* device);
     ~DxvkMetaCopyObjects();
+
+    /**
+     * \brief Gets or creates pipeline for image copies
+     *
+     * \param [in] key Pipeline properties
+     * \returns Pipeline object
+     */
+    DxvkMetaImageCopy getPipeline(const DxvkMetaImageCopy::Key& key);
+
+    /**
+     * \brief Gets or creates pipeline for input attachment-based image copies
+     *
+     * \param [in] key Pipeline properties
+     * \returns Pipeline object
+     */
+    DxvkMetaInputAttachmentImageCopy getPipeline(const DxvkMetaInputAttachmentImageCopy::Key& key);
+
+    /**
+     * \brief Gets or creates pipeline for buffer to image copies
+     *
+     * \param [in] key Pipeline properties
+     * \returns Pipeline object
+     */
+    DxvkMetaBufferToImageCopy getPipeline(const DxvkMetaBufferToImageCopy::Key& key);
+
+    /**
+     * \brief Gets or creates pipeline for image to buffer copies
+     *
+     * \param [in] key Pipeline properties
+     * \returns Pipeline object
+     */
+    DxvkMetaImageToBufferCopy getPipeline(const DxvkMetaImageToBufferCopy::Key& key);
+
+    /**
+     * \brief Gets or creates pipeline for packed image buffer copies
+     *
+     * \param [in] key Pipeline properties
+     * \returns Pipeline object
+     */
+    DxvkMetaPackedBufferImageCopy getPipeline(const DxvkMetaPackedBufferImageCopy::Key& key);
 
     /**
      * \brief Queries color format for d->c copies
@@ -136,75 +311,95 @@ namespace dxvk {
      * \param [in] srcAspect Source aspect mask
      * \returns Corresponding color format
      */
-    DxvkMetaCopyFormats getFormats(
+    DxvkMetaCopyFormats getCopyImageFormats(
             VkFormat              dstFormat,
             VkImageAspectFlags    dstAspect,
             VkFormat              srcFormat,
             VkImageAspectFlags    srcAspect) const;
 
-    /**
-     * \brief Creates pipeline for meta copy operation
-     * 
-     * \param [in] viewType Image view type
-     * \param [in] dstFormat Destination image format
-     * \param [in] dstSamples Destination sample count
-     * \returns Compatible pipeline for the operation
-     */
-    DxvkMetaCopyPipeline getPipeline(
-            VkImageViewType       viewType,
-            VkFormat              dstFormat,
-            VkSampleCountFlagBits dstSamples);
-
-    /**
-     * \brief Creates pipeline for buffer image copy
-     * \returns Compute pipeline for buffer image copies
-     */
-    DxvkMetaCopyPipeline getCopyBufferImagePipeline();
-
   private:
 
-    struct FragShaders {
-      VkShaderModule frag1D = VK_NULL_HANDLE;
-      VkShaderModule frag2D = VK_NULL_HANDLE;
-      VkShaderModule fragMs = VK_NULL_HANDLE;
-    };
-
-    Rc<vk::DeviceFn> m_vkd;
-
-    VkShaderModule m_shaderVert = VK_NULL_HANDLE;
-    VkShaderModule m_shaderGeom = VK_NULL_HANDLE;
-
-    FragShaders m_color;
-    FragShaders m_depth;
-    FragShaders m_depthStencil;
+    DxvkDevice* m_device = nullptr;
 
     dxvk::mutex m_mutex;
 
-    std::unordered_map<
-      DxvkMetaCopyPipelineKey,
-      DxvkMetaCopyPipeline,
-      DxvkHash, DxvkEq> m_pipelines;
+    std::unordered_map<DxvkMetaImageCopy::Key, DxvkMetaImageCopy, DxvkHash, DxvkEq> m_imageCopyPipelines;
+    std::unordered_map<DxvkMetaInputAttachmentImageCopy::Key, DxvkMetaInputAttachmentImageCopy, DxvkHash, DxvkEq> m_inputAttachmentImageCopyPipelines;
+    std::unordered_map<DxvkMetaBufferToImageCopy::Key, DxvkMetaBufferToImageCopy, DxvkHash, DxvkEq> m_bufferImageCopyPipelines;
+    std::unordered_map<DxvkMetaImageToBufferCopy::Key, DxvkMetaImageToBufferCopy, DxvkHash, DxvkEq> m_imageBufferCopyPipelines;
 
-    DxvkMetaCopyPipeline m_copyBufferImagePipeline = { };
+    DxvkMetaPackedBufferImageCopy m_packedImageBufferCopyPipeline = { };
 
-    VkShaderModule createShaderModule(
-      const SpirvCodeBuffer&          code) const;
-    
-    DxvkMetaCopyPipeline createCopyBufferImagePipeline();
+    std::vector<uint32_t> createVsCopyImage(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaImageCopy::Key&       key);
 
-    DxvkMetaCopyPipeline createPipeline(
-      const DxvkMetaCopyPipelineKey&  key);
+    std::vector<uint32_t> createVsCopyInputAttachment(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaInputAttachmentImageCopy::Key& key);
 
-    VkDescriptorSetLayout createDescriptorSetLayout(
-      const DxvkMetaCopyPipelineKey&  key) const;
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout     descriptorSetLayout) const;
-    
-    VkPipeline createPipelineObject(
-      const DxvkMetaCopyPipelineKey&  key,
-            VkPipelineLayout          pipelineLayout);
-    
+    std::vector<uint32_t> createVsCopyBufferToImage(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaBufferToImageCopy::Key& key);
+
+    std::vector<uint32_t> createPsCopyImage(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaImageCopy::Key&       key);
+
+    std::vector<uint32_t> createPsCopyInputAttachment(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaInputAttachmentImageCopy::Key& key);
+
+    std::vector<uint32_t> createPsCopyBufferToImage(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaBufferToImageCopy::Key& key);
+
+    std::vector<uint32_t> createCsCopyImageToBuffer(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaImageToBufferCopy::Key& key);
+
+    std::vector<uint32_t> createCsCopyPackedBufferImage(
+      const DxvkPipelineLayout*           layout,
+      const DxvkMetaPackedBufferImageCopy::Key& key);
+
+    VkPipeline createCopyToImagePipeline(
+      const DxvkPipelineLayout*           layout,
+      const util::DxvkBuiltInShaderStage& vs,
+      const util::DxvkBuiltInShaderStage& ps,
+            VkFormat                      dstFormat,
+            VkImageAspectFlags            dstAspects,
+            VkSampleCountFlagBits         samples,
+            bool                          bitwiseStencil);
+
+    DxvkMetaImageCopy createImageCopyPipeline(
+      const DxvkMetaImageCopy::Key&       key);
+
+    DxvkMetaInputAttachmentImageCopy createInputAttachmentCopyPipeline(
+      const DxvkMetaInputAttachmentImageCopy::Key& key);
+
+    DxvkMetaBufferToImageCopy createBufferToImageCopyPipeline(
+      const DxvkMetaBufferToImageCopy::Key& key);
+
+    DxvkMetaImageToBufferCopy createImageToBufferCopyPipeline(
+      const DxvkMetaImageToBufferCopy::Key& key);
+
+    DxvkMetaPackedBufferImageCopy createPackedImageBufferCopyPipeline(
+      const DxvkMetaPackedBufferImageCopy::Key& key);
+
+    static std::string getName(const DxvkMetaImageCopy::Key& key, const char* type);
+
+    static std::string getName(const DxvkMetaInputAttachmentImageCopy::Key& key, const char* type);
+
+    static std::string getName(const DxvkMetaBufferToImageCopy::Key& key, const char* type);
+
+    static std::string getName(const DxvkMetaImageToBufferCopy::Key& key, const char* type);
+
+    static std::string getName(const DxvkMetaPackedBufferImageCopy::Key& key, const char* type);
+
+    static VkExtent3D determineWorkgroupSize(const DxvkMetaImageToBufferCopy::Key& key);
+
+    static VkExtent3D determineWorkgroupSize(const DxvkMetaPackedBufferImageCopy::Key& key);
+
   };
   
 }

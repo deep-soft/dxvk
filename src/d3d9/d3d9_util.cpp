@@ -39,24 +39,22 @@ namespace dxvk {
 
 
   HRESULT DecodeMultiSampleType(
-    const Rc<DxvkDevice>&           pDevice,
           D3DMULTISAMPLE_TYPE       MultiSample,
           DWORD                     MultisampleQuality,
           VkSampleCountFlagBits*    pSampleCount) {
     uint32_t sampleCount = std::max<uint32_t>(MultiSample, 1u);
 
-    // Check if this is a power of two...
-    if (sampleCount & (sampleCount - 1))
-      return D3DERR_INVALIDCALL;
-
     if (MultiSample == D3DMULTISAMPLE_NONMASKABLE)
       sampleCount = 1u << MultisampleQuality;
 
-    const auto& limits = pDevice->properties().core.properties.limits;
-    VkSampleCountFlags supportedSampleCounts = limits.framebufferColorSampleCounts & limits.framebufferDepthSampleCounts;
+    // 16 is the largest entry in the D3DMULTISAMPLE_TYPE enum
+    // and the largest sample count realistically supported by any hardware.
+    if (sampleCount > 16u)
+      return D3DERR_INVALIDCALL;
 
-    while (sampleCount > supportedSampleCounts)
-      sampleCount >>= 1;
+    // Check if this is a power of two...
+    if (sampleCount & (sampleCount - 1))
+      return D3DERR_NOTAVAILABLE;
 
     if (pSampleCount)
       *pSampleCount = VkSampleCountFlagBits(sampleCount);
@@ -142,22 +140,22 @@ namespace dxvk {
     switch (type) {
       default:
       case D3DPT_TRIANGLELIST:
-        return { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,  VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
 
       case D3DPT_POINTLIST:
-        return { VK_PRIMITIVE_TOPOLOGY_POINT_LIST,     VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_POINT_LIST, false);
 
       case D3DPT_LINELIST:
-        return { VK_PRIMITIVE_TOPOLOGY_LINE_LIST,      VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
 
       case D3DPT_LINESTRIP:
-        return { VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,     VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, false);
 
       case D3DPT_TRIANGLESTRIP:
-        return { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, false);
 
       case D3DPT_TRIANGLEFAN:
-        return { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,   VK_FALSE, 0 };
+        return DxvkInputAssemblyState(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, false);
     }
   }
 
@@ -194,55 +192,6 @@ namespace dxvk {
       case D3DBLENDOP_REVSUBTRACT:  return VK_BLEND_OP_REVERSE_SUBTRACT;
       case D3DBLENDOP_MIN:          return VK_BLEND_OP_MIN;
       case D3DBLENDOP_MAX:          return VK_BLEND_OP_MAX;
-    }
-  }
-
-
-  VkFilter DecodeFilter(D3DTEXTUREFILTERTYPE Filter) {
-    switch (Filter) {
-    case D3DTEXF_NONE:
-    case D3DTEXF_POINT:
-      return VK_FILTER_NEAREST;
-    default:
-      return VK_FILTER_LINEAR;
-    }
-  }
-
-
-  D3D9MipFilter DecodeMipFilter(D3DTEXTUREFILTERTYPE Filter) {
-    D3D9MipFilter filter;
-    filter.MipsEnabled = Filter != D3DTEXF_NONE;
-
-    switch (Filter) {
-    case D3DTEXF_POINT:
-    case D3DTEXF_NONE:
-      filter.MipFilter = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
-    default:
-      filter.MipFilter = VK_SAMPLER_MIPMAP_MODE_LINEAR; break;
-    }
-
-    return filter;
-  }
-
-
-  bool IsAnisotropic(D3DTEXTUREFILTERTYPE Filter) {
-    return Filter == D3DTEXF_ANISOTROPIC;
-  }
-
-
-  VkSamplerAddressMode DecodeAddressMode(D3DTEXTUREADDRESS Mode) {
-    switch (Mode) {
-      default:
-      case D3DTADDRESS_WRAP:
-        return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-      case D3DTADDRESS_MIRROR:
-        return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-      case D3DTADDRESS_CLAMP:
-        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      case D3DTADDRESS_BORDER:
-        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-      case D3DTADDRESS_MIRRORONCE:
-        return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
     }
   }
 
@@ -338,6 +287,7 @@ namespace dxvk {
     extent.depth  = box.Back   - box.Front;
   }
 
+
   void ConvertRect(RECT rect, VkOffset3D& offset, VkExtent3D& extent) {
     offset.x = rect.left;
     offset.y = rect.top;
@@ -348,6 +298,7 @@ namespace dxvk {
     extent.depth  = 1;
   }
 
+
   void ConvertRect(RECT rect, VkOffset2D& offset, VkExtent2D& extent) {
     offset.x = rect.left;
     offset.y = rect.top;
@@ -355,6 +306,7 @@ namespace dxvk {
     extent.width  = rect.right  - rect.left;
     extent.height = rect.bottom - rect.top;
   }
+
 
   uint32_t GetDecltypeSize(D3DDECLTYPE Type) {
     switch (Type) {
@@ -401,34 +353,6 @@ namespace dxvk {
       case D3DDECLTYPE_FLOAT16_4: return 4;
       default:                    return 0;
     }
-  }
-
-
-  bool IsDepthFormat(D3D9Format Format) {
-    return Format == D3D9Format::D16_LOCKABLE
-        || Format == D3D9Format::D32
-        || Format == D3D9Format::D15S1
-        || Format == D3D9Format::D24S8
-        || Format == D3D9Format::D24X8
-        || Format == D3D9Format::D24X4S4
-        || Format == D3D9Format::D16
-        || Format == D3D9Format::D32F_LOCKABLE
-        || Format == D3D9Format::D24FS8
-        || Format == D3D9Format::D32_LOCKABLE
-        || Format == D3D9Format::DF16
-        || Format == D3D9Format::DF24
-        || Format == D3D9Format::INTZ;
-  }
-
-  bool IsDepthStencilFormat(D3D9Format Format) {
-    return IsDepthFormat(Format) || Format == D3D9Format::S8_LOCKABLE;
-  }
-
-  bool IsLockableDepthStencilFormat(D3D9Format Format) {
-    return Format == D3D9Format::S8_LOCKABLE
-        || Format == D3D9Format::D16_LOCKABLE
-        || Format == D3D9Format::D32_LOCKABLE
-        || Format == D3D9Format::D32F_LOCKABLE;
   }
 
 }

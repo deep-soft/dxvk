@@ -2,39 +2,52 @@
 
 #include "dxvk_format.h"
 #include "dxvk_include.h"
+#include "dxvk_pipelayout.h"
 
 #include "../spirv/spirv_code_buffer.h"
 
 namespace dxvk {
 
   class DxvkDevice;
-  
+
   /**
-   * \brief Clear args
-   * 
-   * The data structure that can be passed
-   * to the clear shaders as push constants.
+   * \brief Clear pipeline info
+   *
+   * Primarily used to clear storage image or buffer views.
    */
-  struct DxvkMetaClearArgs {
-    VkClearColorValue clearValue;
-    VkOffset3D offset; uint32_t pad1;
-    VkExtent3D extent; uint32_t pad2;
+  struct DxvkMetaClear {
+    /** Shader arguments for clear pipeline */
+    struct Args {
+      VkClearColorValue clearValue = { };
+      VkOffset3D offset = { };
+      VkExtent3D extent = { };
+    };
+
+    /** Look-up info for clear pipeline. Set view type to
+     *  MAX_ENUM in order to create a buffer pipeline. */
+    struct Key {
+      VkImageViewType viewType  = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat        format    = VK_FORMAT_UNDEFINED;
+
+      bool eq(const Key& other) const {
+        return viewType == other.viewType
+            && format   == other.format;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(viewType));
+        hash.add(uint32_t(format));
+        return hash;
+      }
+    };
+
+    /** Pipeline properties */
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkExtent3D workgroupSize = { };
   };
-  
-  
-  /**
-   * \brief Pipeline-related objects
-   * 
-   * Use this to bind the pipeline
-   * and allocate a descriptor set.
-   */
-  struct DxvkMetaClearPipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeline;
-    VkExtent3D            workgroupSize;
-  };
-  
+
   
   /**
    * \brief Clear shaders and related objects
@@ -47,65 +60,31 @@ namespace dxvk {
     
   public:
     
-    DxvkMetaClearObjects(const DxvkDevice* device);
+    DxvkMetaClearObjects(DxvkDevice* device);
     ~DxvkMetaClearObjects();
     
     /**
-     * \brief Retrieves objects to use for buffers
-     * 
-     * Returns the pipeline, pipeline layout and descriptor
-     * set layout which are required to perform a meta clear
-     * operation on a buffer resource with the given format.
-     * \param [in] viewType The image virw type
+     * \brief Creates or retrieves clear pipeline
+     * \param [in] key Required pipeline properties
      */
-    DxvkMetaClearPipeline getClearBufferPipeline(
-            DxvkFormatFlags       formatFlags) const;
-    
-    /**
-     * \brief Retrieves objects for a given image view type
-     * 
-     * Returns the pipeline, pipeline layout and descriptor
-     * set layout which are required to perform a meta clear
-     * operation on a resource with the given view type.
-     * \param [in] viewType The image virw type
-     * \returns The pipeline-related objects to use
-     */
-    DxvkMetaClearPipeline getClearImagePipeline(
-            VkImageViewType       viewType,
-            DxvkFormatFlags       formatFlags) const;
+    DxvkMetaClear getPipeline(const DxvkMetaClear::Key& key);
     
   private:
-    
-    struct DxvkMetaClearPipelines {
-      VkPipeline clearBuf        = VK_NULL_HANDLE;
-      VkPipeline clearImg1D      = VK_NULL_HANDLE;
-      VkPipeline clearImg2D      = VK_NULL_HANDLE;
-      VkPipeline clearImg3D      = VK_NULL_HANDLE;
-      VkPipeline clearImg1DArray = VK_NULL_HANDLE;
-      VkPipeline clearImg2DArray = VK_NULL_HANDLE;
-    };
-    
-    Rc<vk::DeviceFn> m_vkd;
-    
-    VkDescriptorSetLayout m_clearBufDsetLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_clearImgDsetLayout = VK_NULL_HANDLE;
-    
-    VkPipelineLayout m_clearBufPipeLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_clearImgPipeLayout = VK_NULL_HANDLE;
-    
-    DxvkMetaClearPipelines m_clearPipesF32;
-    DxvkMetaClearPipelines m_clearPipesU32;
-    
-    VkDescriptorSetLayout createDescriptorSetLayout(
-            VkDescriptorType        descriptorType);
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout   dsetLayout);
-    
-    VkPipeline createPipeline(
-      const SpirvCodeBuffer&        spirvCode,
-            VkPipelineLayout        pipeLayout);
-    
+
+    DxvkDevice* m_device = nullptr;
+
+    dxvk::mutex m_mutex;
+
+    std::unordered_map<DxvkMetaClear::Key, DxvkMetaClear, DxvkHash, DxvkEq> m_pipelines;
+
+    VkExtent3D determineWorkgroupSize(const DxvkMetaClear::Key& key) const;
+
+    std::vector<uint32_t> createShader(const DxvkMetaClear::Key& key, const DxvkPipelineLayout* layout);
+
+    DxvkMetaClear createPipeline(const DxvkMetaClear::Key& key);
+
+    static std::string getName(const DxvkMetaClear::Key& key);
+
   };
   
 }

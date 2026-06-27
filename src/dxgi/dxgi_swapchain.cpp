@@ -22,7 +22,8 @@ namespace dxvk {
     m_presentId (0u),
     m_presenter (pPresenter),
     m_monitor   (wsi::getWindowMonitor(m_window)),
-    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))) {
+    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))),
+    m_destructionNotifier(this) {
 
     if (FAILED(m_presenter->GetAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&m_adapter))))
       throw DxvkError("DXGI: Failed to get adapter for present device");
@@ -39,10 +40,21 @@ namespace dxvk {
     
     // Apply initial window mode and fullscreen state
     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
-      throw DxvkError("DXGI: Failed to set initial fullscreen state");
+    {
+      Logger::warn("DXGI: EnterFullscreenMode failed. Creating a windowed swapchain instead.");
+      m_descFs.Windowed = TRUE;
+    }
 
     // Ensure that RGBA16 swap chains are scRGB if supported
     UpdateColorSpace(m_desc.Format, m_colorSpace);
+
+    // Somewhat hacky way to determine whether to forward the
+    // display refresh rate in windowed mode even with a sync
+    // interval of 1.
+    if (!m_is_d3d12) {
+      auto instance = pFactory->GetDXVKInstance();
+      m_hasLatencyControl = instance->options().latencySleep == Tristate::True;
+    }
   }
   
   
@@ -77,6 +89,11 @@ namespace dxvk {
      || riid == __uuidof(IDXGISwapChain3)
      || riid == __uuidof(IDXGISwapChain4)) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
       return S_OK;
     }
     
@@ -342,12 +359,14 @@ namespace dxvk {
       SyncInterval = options->syncInterval;
 
     UpdateGlobalHDRState();
-    UpdateTargetFrameRate(SyncInterval);
+
+    if (!(PresentFlags & DXGI_PRESENT_TEST))
+      UpdateTargetFrameRate(SyncInterval);
 
     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
     HRESULT hr = S_OK;
 
-    if (wsi::isWindow(m_window)) {
+    if (wsi::isWindow(m_window) || !m_window) {
       std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
       hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
     }
@@ -406,7 +425,7 @@ namespace dxvk {
           UINT                      SwapChainFlags,
     const UINT*                     pCreationNodeMask,
           IUnknown* const*          ppPresentQueue) {
-    if (!wsi::isWindow(m_window))
+    if (m_window && !wsi::isWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
 
     constexpr UINT PreserveFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -418,9 +437,11 @@ namespace dxvk {
     m_desc.Width  = Width;
     m_desc.Height = Height;
     
-    wsi::getWindowSize(m_window,
-      m_desc.Width  ? nullptr : &m_desc.Width,
-      m_desc.Height ? nullptr : &m_desc.Height);
+    if (m_window) {
+      wsi::getWindowSize(m_window,
+        m_desc.Width  ? nullptr : &m_desc.Width,
+        m_desc.Height ? nullptr : &m_desc.Height);
+    }
     
     if (BufferCount != 0)
       m_desc.BufferCount = BufferCount;
@@ -475,12 +496,23 @@ namespace dxvk {
         Logger::err("DXGI: ResizeTarget: Failed to query containing output");
         return E_FAIL;
       }
-      
-      ChangeDisplayMode(output.ptr(), &newDisplayMode);
 
+      RECT bounds = { };
+      wsi::getDesktopCoordinates(m_monitor, &bounds);
+
+      uint32_t width = 0u;
+      uint32_t height = 0u;
+
+      wsi::getWindowSize(m_window, &width, &height);
+
+      // Window bounds were changed behind our back, update saved state
+      if (uint32_t(bounds.right - bounds.left) != width || uint32_t(bounds.bottom - bounds.top) != height)
+        wsi::saveWindowState(m_window, &m_windowState, false);
+
+      ChangeDisplayMode(output.ptr(), &newDisplayMode);
       wsi::updateFullscreenWindow(m_monitor, m_window, false);
     }
-    
+
     return S_OK;
   }
   
@@ -526,7 +558,11 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetRotation(
           DXGI_MODE_ROTATION        Rotation) {
-    Logger::err("DxgiSwapChain::SetRotation: Not implemented");
+
+    if (Rotation == DXGI_MODE_ROTATION_IDENTITY)
+      return S_OK;
+
+    Logger::err(str::format("DxgiSwapChain::SetRotation(", Rotation,"): Not implemented"));
     return E_NOTIMPL;
   }
   
@@ -684,6 +720,20 @@ namespace dxvk {
 
     if (!wsi::isWindow(m_window))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+    if (!(m_descFs.ScanlineOrdering >= DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED
+     && m_descFs.ScanlineOrdering <= DXGI_MODE_SCANLINE_ORDER_LOWER_FIELD_FIRST))
+    {
+      Logger::err(str::format("DXGI: EnterFullscreenMode: Invalid scanline order ", m_descFs.ScanlineOrdering));
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!(m_descFs.Scaling >= DXGI_MODE_SCALING_UNSPECIFIED
+     && m_descFs.Scaling <= DXGI_MODE_SCALING_STRETCHED))
+    {
+      Logger::err(str::format("DXGI: EnterFullscreenMode: Invalid scaling ", m_descFs.Scaling));
+      return DXGI_ERROR_INVALID_CALL;
+    }
     
     if (output == nullptr) {
       if (FAILED(GetOutputFromMonitor(wsi::getWindowMonitor(m_window), &output))) {
@@ -715,6 +765,8 @@ namespace dxvk {
 
     DXGI_OUTPUT_DESC desc;
     output->GetDesc(&desc);
+
+    wsi::saveWindowState(m_window, &m_windowState, true);
 
     if (!wsi::enterFullscreenMode(desc.Monitor, m_window, &m_windowState, modeSwitch)) {
       Logger::err("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
@@ -768,10 +820,11 @@ namespace dxvk {
     if (!wsi::isWindow(m_window))
       return S_OK;
     
-    if (!wsi::leaveFullscreenMode(m_window, &m_windowState, true)) {
+    if (!wsi::leaveFullscreenMode(m_window, &m_windowState)) {
       Logger::err("DXGI: LeaveFullscreenMode: Failed to exit fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
+    wsi::restoreWindowState(m_window, &m_windowState, true);
     
     return S_OK;
   }
@@ -813,7 +866,7 @@ namespace dxvk {
     if (!selectedMode.RefreshRate.Denominator)
       selectedMode.RefreshRate.Denominator = 1;
 
-    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, ConvertDisplayMode(selectedMode)))
+    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, &m_windowState, ConvertDisplayMode(selectedMode)))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
 
     DXGI_VK_MONITOR_DATA* monitorData = nullptr;
@@ -997,16 +1050,41 @@ namespace dxvk {
     if (m_presenter2 == nullptr)
       return;
 
+    // Engage the frame limiter with large sync intervals even in windowed
+    // mode since we want to avoid double-presenting to the swap chain.
+    if (SyncInterval != m_frameRateSyncInterval && m_descFs.Windowed) {
+      bool engageLimiter = (SyncInterval > 1u) || (SyncInterval && m_hasLatencyControl);
+
+      m_frameRateSyncInterval = SyncInterval;
+      m_frameRateRefresh = 0.0f;
+
+      if (engageLimiter && wsi::isWindow(m_window)) {
+        wsi::WsiMode mode = { };
+
+        if (wsi::getCurrentDisplayMode(wsi::getWindowMonitor(m_window), &mode)) {
+          if (mode.refreshRate.numerator && mode.refreshRate.denominator) {
+            m_frameRateRefresh = double(mode.refreshRate.numerator)
+                               / double(mode.refreshRate.denominator);
+          }
+        }
+      }
+    } else if (!m_descFs.Windowed) {
+      // Reset tracking when in fullscreen mode
+      m_frameRateSyncInterval = 0;
+    }
+
     // Use a negative number to indicate that the limiter should only
     // be engaged if the target frame rate is actually exceeded
-    double frameRate = std::max(m_frameRateOption, 0.0);
+    double frameRate = m_frameRateOption;
 
-    if (SyncInterval && m_frameRateOption == 0.0)
-      frameRate = -m_frameRateRefresh / double(SyncInterval);
+    if (frameRate != -1.0) {
+      if (SyncInterval && frameRate == 0.0)
+        frameRate = -m_frameRateRefresh / double(SyncInterval);
 
-    if (m_frameRateLimit != frameRate) {
-      m_frameRateLimit = frameRate;
-      m_presenter2->SetTargetFrameRate(frameRate);
+      if (m_frameRateLimit != frameRate) {
+        m_frameRateLimit = frameRate;
+        m_presenter2->SetTargetFrameRate(frameRate);
+      }
     }
   }
 

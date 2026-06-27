@@ -7,76 +7,91 @@
 
 #include "dxvk_barrier.h"
 #include "dxvk_cmdlist.h"
-#include "dxvk_resource.h"
+#include "dxvk_image.h"
 
 namespace dxvk {
 
   /**
-   * \brief Resolve pipeline
-   * 
-   * Stores the objects for a single pipeline
-   * that is used for fragment shader resolve.
+   * \brief Resolve pipeline properties
+   *
+   * This is used in a few situations where render pass resolves won't
+   * work, e.g. if the source and destination offsets differ, or when
+   * unsupported resolve modes are used, such as SAMPLE_ZERO on color
+   * formats for implicit resolves.
    */
-  struct DxvkMetaResolvePipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeHandle;
+  struct DxvkMetaResolve {
+    /** Shader arguments for resolve pipeline */
+    struct Args {
+      VkOffset2D srcOffset    = { };
+      VkExtent2D extent       = { };
+      uint32_t   layer        = 0u;
+      uint32_t   stencilBit   = 0u;
+    };
+
+    /** Look-up key for resolve pipelines */
+    struct Key {
+      VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      VkFormat format = VK_FORMAT_UNDEFINED;
+      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+      VkResolveModeFlagBits mode = VK_RESOLVE_MODE_NONE;
+      VkResolveModeFlagBits modeStencil = VK_RESOLVE_MODE_NONE;
+      VkBool32 bitwiseStencil = VK_FALSE;
+
+      bool eq(const Key& other) const {
+        return viewType       == other.viewType
+            && format         == other.format
+            && samples        == other.samples
+            && mode           == other.mode
+            && modeStencil    == other.modeStencil
+            && bitwiseStencil == other.bitwiseStencil;
+      }
+
+      size_t hash() const {
+        DxvkHashState hash;
+        hash.add(uint32_t(viewType));
+        hash.add(uint32_t(format));
+        hash.add(uint32_t(samples));
+        hash.add(uint32_t(mode));
+        hash.add(uint32_t(modeStencil));
+        hash.add(uint32_t(bitwiseStencil));
+        return hash;
+      }
+    };
+
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
   };
 
   /**
-   * \brief Copy pipeline key
-   * 
-   * Used to look up copy pipelines based
-   * on the copy operation they support.
+   * \brief Meta resolve views
+   *
+   * Creates views for attachment resolves if shader stage is 0,
+   * or for pipeline-based resolves using the given shader stage.
+   * TODO unify with copy path.
    */
-  struct DxvkMetaResolvePipelineKey {
-    VkFormat                  format;
-    VkSampleCountFlagBits     samples;
-    VkResolveModeFlagBits     modeD;
-    VkResolveModeFlagBits     modeS;
-
-    bool eq(const DxvkMetaResolvePipelineKey& other) const {
-      return this->format  == other.format
-          && this->samples == other.samples
-          && this->modeD   == other.modeD
-          && this->modeS   == other.modeS;
-    }
-
-    size_t hash() const {
-      return (uint32_t(format)  << 4)
-           ^ (uint32_t(samples) << 0)
-           ^ (uint32_t(modeD)   << 12)
-           ^ (uint32_t(modeS)   << 16);
-    }
-  };
-
-  /**
-   * \brief Meta resolve views for attachment-based resolves
-   */
-  class DxvkMetaResolveViews : public DxvkResource {
+  class DxvkMetaResolveViews {
 
   public:
 
     DxvkMetaResolveViews(
-      const Rc<vk::DeviceFn>&         vkd,
       const Rc<DxvkImage>&            dstImage,
       const VkImageSubresourceLayers& dstSubresources,
+            VkFormat                  dstFormat,
       const Rc<DxvkImage>&            srcImage,
       const VkImageSubresourceLayers& srcSubresources,
-            VkFormat                  format);
+            VkFormat                  srcFormat,
+            VkShaderStageFlags        shaderStage);
 
     ~DxvkMetaResolveViews();
 
-    VkImageView getDstView() const { return m_dstImageView; }
-    VkImageView getSrcView() const { return m_srcImageView; }
+    Rc<DxvkImageView> dstView;
+    Rc<DxvkImageView> srcView;
+    Rc<DxvkImageView> srcStencilView;
 
-  private:
-
-    Rc<vk::DeviceFn> m_vkd;
-
-    VkImageView m_dstImageView = VK_NULL_HANDLE;
-    VkImageView m_srcImageView = VK_NULL_HANDLE;
-
+    static VkImageViewType viewType(
+      const DxvkImage&                image,
+      const VkImageSubresourceLayers& subresources,
+            VkImageUsageFlags         usage);
   };
 
 
@@ -90,59 +105,39 @@ namespace dxvk {
 
   public:
 
-    DxvkMetaResolveObjects(const DxvkDevice* device);
+    DxvkMetaResolveObjects(DxvkDevice* device);
     ~DxvkMetaResolveObjects();
 
     /**
      * \brief Creates pipeline for meta copy operation
      * 
-     * \param [in] format Destination image format
-     * \param [in] samples Destination sample count
-     * \param [in] depthResolveMode Depth resolve mode
-     * \param [in] stencilResolveMode Stencil resolve mode
+     * \param [in] key Requested resolve pipeline properties
      * \returns Compatible pipeline for the operation
      */
-    DxvkMetaResolvePipeline getPipeline(
-            VkFormat                  format,
-            VkSampleCountFlagBits     samples,
-            VkResolveModeFlagBits     depthResolveMode,
-            VkResolveModeFlagBits     stencilResolveMode);
+    DxvkMetaResolve getPipeline(const DxvkMetaResolve::Key& key);
 
   private:
 
-    Rc<vk::DeviceFn> m_vkd;
-
-    VkShaderModule m_shaderVert  = VK_NULL_HANDLE;
-    VkShaderModule m_shaderGeom  = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragF = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragU = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragI = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragD = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragDS = VK_NULL_HANDLE;
+    DxvkDevice* m_device = nullptr;
 
     dxvk::mutex m_mutex;
 
-    std::unordered_map<
-      DxvkMetaResolvePipelineKey,
-      DxvkMetaResolvePipeline,
-      DxvkHash, DxvkEq> m_pipelines;
-    
-    VkShaderModule createShaderModule(
-      const SpirvCodeBuffer&          code) const;
-    
-    DxvkMetaResolvePipeline createPipeline(
-      const DxvkMetaResolvePipelineKey& key);
+    std::unordered_map<DxvkMetaResolve::Key, DxvkMetaResolve, DxvkHash, DxvkEq> m_pipelines;
 
-    VkDescriptorSetLayout createDescriptorSetLayout(
-      const DxvkMetaResolvePipelineKey& key);
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout  descriptorSetLayout);
-    
-    VkPipeline createPipelineObject(
-      const DxvkMetaResolvePipelineKey& key,
-            VkPipelineLayout       pipelineLayout);
-    
+    std::vector<uint32_t> createVs(
+      const DxvkMetaResolve::Key&       key,
+      const DxvkPipelineLayout*         layout);
+
+    std::vector<uint32_t> createPs(
+      const DxvkMetaResolve::Key&       key,
+      const DxvkPipelineLayout*         layout);
+
+    DxvkMetaResolve createPipeline(const DxvkMetaResolve::Key& key);
+
+    static std::string getName(const DxvkMetaResolve::Key& key, const char* type);
+
+    static const char* getModeName(VkResolveModeFlagBits mode);
+
   };
 
 }

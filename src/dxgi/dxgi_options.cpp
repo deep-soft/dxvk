@@ -28,18 +28,69 @@ namespace dxvk {
 
   /* First generation XeSS causes crash on proton for Intel due to missing
    * Intel interface. Avoid crash by pretending to be non-Intel if the
-   * libxess.dll module is loaded by an application.
-   */
-  static bool isXessUsed() {
-#ifdef _WIN32
-      if (GetModuleHandleA("libxess") != nullptr ||
-          GetModuleHandleA("libxess_dx11") != nullptr)
-        return true;
-      else
-        return false;
-#else
+   * libxess.dll module is loaded by an application. */
+  static bool isXess1xUsed() {
+    #ifdef _WIN32
+    HMODULE libxess = nullptr;
+
+    // Use Ex variant here to keep the library loaded while we use the handle
+    if (!GetModuleHandleExA(0u, "libxess", &libxess)
+     && !GetModuleHandleExA(0u, "libxess_dx11", &libxess))
       return false;
-#endif
+
+    if (!libxess)
+      return false;
+
+    // For some reason it seems to be impossible to just query
+    // the length, need to pre-allocate for the worst case
+    std::array<char, MAX_PATH + 1u> fileName = {};
+    auto nameLen = GetModuleFileNameA(libxess, fileName.data(), fileName.size());
+
+    // Should be safe to release the module now, we only operate
+    // on the actual file from now on
+    FreeLibrary(libxess);
+
+    if (!nameLen) {
+      Logger::warn("DXGI: Failed to get file name for XeSS module");
+      return true;
+    }
+
+    // Query version info blob size...
+    auto fiSize = GetFileVersionInfoSizeA(fileName.data(), nullptr);
+
+    if (!fiSize) {
+      Logger::warn("DXGI: Failed to get XeSS version info size");
+      return true;
+    }
+
+    // Retrieve actual version info blob
+    std::vector<char> fiData(fiSize);
+
+    if (!GetFileVersionInfoA(fileName.data(), 0u, fiSize, fiData.data())) {
+      Logger::warn("DXGI: Failed to get XeSS version info");
+      return true;
+    }
+
+    void* fiBlock = nullptr;
+    UINT fiBlockSize = 0u;
+
+    if (!VerQueryValueA(fiData.data(), "\\", &fiBlock, &fiBlockSize)) {
+      Logger::warn("DXGI: Failed to get XeSS version info block");
+      return true;
+    }
+
+    auto fiBlockTyped = reinterpret_cast<const VS_FIXEDFILEINFO*>(fiBlock);
+
+    if (!fiBlockTyped || fiBlockSize < sizeof(*fiBlockTyped)) {
+      Logger::warn("DXGI: Invalid XeSS version info block");
+      return true;
+    }
+
+    // XeSS 2.0 onwards should be fine
+    return fiBlockTyped->dwProductVersionMS < 0x20000u;
+    #else
+    return false;
+    #endif
   }
 
   static bool isNvapiEnabled() {
@@ -47,7 +98,7 @@ namespace dxvk {
   }
 
 
-  static bool isHDRDisallowed() {
+  static bool isHDRDisallowed(bool enableUe4Workarounds) {
 #ifdef _WIN32
     // Unreal Engine 4 titles use AGS/NVAPI to try and enable
     // HDR globally.
@@ -70,7 +121,7 @@ namespace dxvk {
     // Luckily for us, they only load d3d12.dll on the D3D12 render path
     // so we can key off that to force disable HDR only in D3D11.
     std::string exeName = env::getExeName();
-    bool isUE4 = exeName.find("-Win64-Shipping") != std::string::npos;
+    bool isUE4 = enableUe4Workarounds || exeName.find("-Win64-Shipping") != std::string::npos;
     bool hasD3D12 = GetModuleHandleA("d3d12") != nullptr;
 
     if (isUE4 && !hasD3D12 && !isNvapiEnabled())
@@ -90,8 +141,13 @@ namespace dxvk {
     this->maxDeviceMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxDeviceMemory", 0)) << 20;
     this->maxSharedMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxSharedMemory", 0)) << 20;
 
-    this->maxFrameRate = config.getOption<int32_t>("dxgi.maxFrameRate", 0);
-    this->syncInterval = config.getOption<int32_t>("dxgi.syncInterval", -1);
+    this->maxFrameRate     = config.getOption<int32_t>("dxvk.maxFrameRate",
+                             config.getOption<int32_t>("dxgi.maxFrameRate", 0));
+    this->syncInterval     = config.getOption<int32_t>("dxgi.syncInterval", -1);
+    this->forceRefreshRate = config.getOption<int32_t>("dxgi.forceRefreshRate", 0u);
+
+    // We don't support dcomp swapchains and some games may rely on them failing on creation
+    this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);
 
     // Expose Nvidia GPUs properly if NvAPI is enabled in environment
     this->hideNvidiaGpu = !isNvapiEnabled();
@@ -108,14 +164,17 @@ namespace dxvk {
     this->hideAmdGpu = config.getOption<Tristate>("dxgi.hideAmdGpu", Tristate::Auto) == Tristate::True;
     this->hideIntelGpu = config.getOption<Tristate>("dxgi.hideIntelGpu", Tristate::Auto) == Tristate::True;
 
-    /* Force vendor ID to non-Intel ID when XeSS is in use */
-    if (isXessUsed()) {
-      Logger::info(str::format("Detected XeSS usage, hiding Intel GPU Vendor"));
+    // Old XeSS libraries will crash if an Intel GPU is detected
+    if (isXess1xUsed()) {
+      Logger::info(str::format("Detected XeSS 1.x usage, hiding Intel GPU Vendor"));
       this->hideIntelGpu = true;
     }
 
     this->enableHDR = config.getOption<bool>("dxgi.enableHDR", env::getEnvVar("DXVK_HDR") == "1");
-    if (this->enableHDR && isHDRDisallowed()) {
+
+    bool enableUe4Workarounds = config.getOption<bool>("dxgi.enableUe4Workarounds", false);
+
+    if (this->enableHDR && isHDRDisallowed(enableUe4Workarounds)) {
       Logger::info("HDR was configured to be enabled, but has been force disabled as a UE4 DX11 game was detected.");
       this->enableHDR = false;
     }

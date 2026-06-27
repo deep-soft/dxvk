@@ -2,6 +2,8 @@
 
 #include <vector>
 
+#include "../util/util_small_vector.h"
+
 #include "dxvk_meta_blit.h"
 
 namespace dxvk {
@@ -13,15 +15,15 @@ namespace dxvk {
    * a render pass object for mip map generation.
    * This must be created per image view.
    */
-  class DxvkMetaMipGenRenderPass : public DxvkResource {
+  class DxvkMetaMipGenViews {
     
   public:
     
-    DxvkMetaMipGenRenderPass(
-      const Rc<vk::DeviceFn>&   vkd,
-      const Rc<DxvkImageView>&  view);
+    DxvkMetaMipGenViews(
+      const Rc<DxvkImageView>&  view,
+            VkPipelineBindPoint bindPoint);
     
-    ~DxvkMetaMipGenRenderPass();
+    ~DxvkMetaMipGenViews();
     
     /**
      * \brief Source image view type
@@ -50,8 +52,8 @@ namespace dxvk {
      * \param [in] pass Render pass index
      * \returns Source image view handle for the given pass
      */
-    VkImageView getSrcView(uint32_t passId) const {
-      return m_passes.at(passId).src;
+    Rc<DxvkImageView> getSrcView(uint32_t passId) const {
+      return m_passes[passId].src;
     }
 
     /**
@@ -60,8 +62,8 @@ namespace dxvk {
      * \param [in] pass Render pass index
      * \returns Destination image view handle for the given pass
      */
-    VkImageView getDstView(uint32_t passId) const {
-      return m_passes.at(passId).dst;
+    Rc<DxvkImageView> getDstView(uint32_t passId) const {
+      return m_passes[passId].dst;
     }
 
     /**
@@ -130,20 +132,102 @@ namespace dxvk {
   private:
 
     struct PassViews {
-      VkImageView src;
-      VkImageView dst;
+      Rc<DxvkImageView> src;
+      Rc<DxvkImageView> dst;
     };
 
-    Rc<vk::DeviceFn>  m_vkd;
     Rc<DxvkImageView> m_view;
+
+    VkPipelineBindPoint m_bindPoint;
     
-    VkImageViewType m_srcViewType;
-    VkImageViewType m_dstViewType;
+    VkImageViewType m_srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    VkImageViewType m_dstViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
     
-    std::vector<PassViews> m_passes;
+    small_vector<PassViews, 16> m_passes;
     
     PassViews createViews(uint32_t pass) const;
     
   };
-  
+
+
+  /**
+   * \brief Push data layout for mip gen pass
+   */
+  struct DxvkMetaMipGenPushConstants {
+    VkDeviceAddress atomicCounterVa = 0u;
+    uint32_t samplerIndex = 0u;
+    uint32_t mipCount = 0u;
+  };
+
+
+  /**
+   * \brief Mip gen pipeline info
+   */
+  struct DxvkMetaMipGenPipeline {
+    const DxvkPipelineLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t mipsPerStep = 0u;
+  };
+
+
+  /**
+   * \brief Spec constants for mip gen pipeline
+   */
+  struct DxvkMetaMipGenSpecConstants {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t formatDwords = 0u;
+  };
+
+
+  /**
+   * \brief Mip gen pipeline objects
+   */
+  class DxvkMetaMipGenObjects {
+
+  public:
+
+    constexpr static uint32_t MipCount = 6u;
+
+    DxvkMetaMipGenObjects(DxvkDevice* device);
+    ~DxvkMetaMipGenObjects();
+
+    /**
+     * \brief Checks format-specific support
+     *
+     * \param [in] format Format to query
+     * \returns \c true if compute mip-gen can be used
+     *    for the given format on the given device.
+     */
+    bool checkFormatSupport(
+            VkFormat              viewFormat);
+
+    /**
+     * \brief Queries pipeline and properties of that pipeline
+     *
+     * Must only be called for supported formats.
+     * \param [in] format Format to create the pipeline for
+     * \returns Pipeline properties
+     */
+    DxvkMetaMipGenPipeline getPipeline(
+            VkFormat              viewFormat);
+
+  private:
+
+    DxvkDevice* m_device = nullptr;
+
+    dxvk::mutex m_mutex;
+
+    const DxvkPipelineLayout* m_layout;
+
+    std::unordered_map<VkFormat, bool> m_formatSupport;
+    std::unordered_map<VkFormat, DxvkMetaMipGenPipeline> m_pipelines;
+
+    const DxvkPipelineLayout* createPipelineLayout() const;
+
+    DxvkMetaMipGenPipeline createPipeline(VkFormat format) const;
+
+    bool queryFormatSupport(VkFormat viewFormat) const;
+
+  };
+
 }

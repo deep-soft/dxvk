@@ -58,7 +58,7 @@ namespace dxvk {
     } vsConsts;
 
     struct {
-      bit::bitset<caps::MaxFloatConstantsPS>            fConsts;
+      bit::bitset<caps::MaxSM3FloatConstantsPS>         fConsts;
       bit::bitset<caps::MaxOtherConstants>              iConsts;
       bit::bitset<caps::MaxOtherConstants>              bConsts;
     } psConsts;
@@ -66,19 +66,20 @@ namespace dxvk {
     bit::bitvector                                      lightEnabledChanges;
   };
 
-  enum class D3D9StateBlockType :uint32_t {
+  enum class D3D9StateBlockType : uint8_t {
     None,
-    VertexState,
+    All,
     PixelState,
-    All
+    VertexState,
+    Unknown
   };
 
   inline D3D9StateBlockType ConvertStateBlockType(D3DSTATEBLOCKTYPE type) {
     switch (type) {
+      case D3DSBT_ALL:         return D3D9StateBlockType::All;
       case D3DSBT_PIXELSTATE:  return D3D9StateBlockType::PixelState;
       case D3DSBT_VERTEXSTATE: return D3D9StateBlockType::VertexState;
-      default:
-      case D3DSBT_ALL:         return D3D9StateBlockType::All;
+      default:                 return D3D9StateBlockType::Unknown;
     }
   }
 
@@ -140,8 +141,6 @@ namespace dxvk {
             DWORD                      Stage,
             D3D9TextureStageStateTypes Type,
             DWORD                      Value);
-
-    HRESULT MultiplyStateTransform(uint32_t idx, const D3DMATRIX* pMatrix);
 
     HRESULT SetViewport(const D3DVIEWPORT9* pViewport);
 
@@ -279,7 +278,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.vsConsts.fConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetVertexShaderConstantF(idx, (float*)&src->vsConsts->fConsts[idx], 1);
+            dst->SetVertexShaderConstantF(idx, reinterpret_cast<const float*>(&src->vsConsts->fConsts[idx]), 1);
           }
         }
 
@@ -287,7 +286,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.vsConsts.iConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetVertexShaderConstantI(idx, (int*)&src->vsConsts->iConsts[idx], 1);
+            dst->SetVertexShaderConstantI(idx, reinterpret_cast<const int*>(&src->vsConsts->iConsts[idx]), 1);
           }
         }
 
@@ -302,7 +301,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.psConsts.fConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetPixelShaderConstantF(idx, (float*)&src->psConsts->fConsts[idx], 1);
+            dst->SetPixelShaderConstantF(idx, reinterpret_cast<const float*>(&src->psConsts->fConsts[idx]), 1);
           }
         }
 
@@ -310,7 +309,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.psConsts.iConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetPixelShaderConstantI(idx, (int*)&src->psConsts->iConsts[idx], 1);
+            dst->SetPixelShaderConstantI(idx, reinterpret_cast<const int*>(&src->psConsts->iConsts[idx]), 1);
           }
         }
 
@@ -322,16 +321,18 @@ namespace dxvk {
 
       if (m_captures.flags.test(D3D9CapturedStateFlag::Lights)) {
         for (uint32_t i = 0; i < src->lights.size(); i++) {
-          if (!src->lights[i].has_value())
+          if (!src->lights[i].isValid)
             continue;
 
-          dst->SetLight(i, &src->lights[i].value());
+          dst->SetLight(i, &src->lights[i].light);
         }
+
         for (uint32_t i = 0; i < m_captures.lightEnabledChanges.dwordCount(); i++) {
           for (uint32_t consts : bit::BitMask(m_captures.lightEnabledChanges.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->LightEnable(idx, src->IsLightEnabled(idx));
+            if (idx < src->lights.size())
+              dst->LightEnable(idx, src->lights[idx].isEnabled);
           }
         }
       }
@@ -346,7 +347,7 @@ namespace dxvk {
     }
 
     template <
-      DxsoProgramType  ProgramType,
+      D3D9ShaderType   ShaderType,
       D3D9ConstantType ConstantType,
       typename         T>
     HRESULT SetShaderConstants(
@@ -354,7 +355,7 @@ namespace dxvk {
       const T*    pConstantData,
             UINT  Count) {
       auto SetHelper = [&](auto& setCaptures) {
-        if constexpr (ProgramType == DxsoProgramTypes::VertexShader)
+        if constexpr (ShaderType == D3D9ShaderType::VertexShader)
           m_captures.flags.set(D3D9CapturedStateFlag::VsConstants);
         else
           m_captures.flags.set(D3D9CapturedStateFlag::PsConstants);
@@ -369,30 +370,19 @@ namespace dxvk {
             setCaptures.bConsts.set(reg, true);
         }
 
-        UpdateStateConstants<
-          ProgramType,
-          ConstantType,
-          T>(
-            &m_state,
-            StartRegister,
-            pConstantData,
-            Count,
-            false);
+        UpdateStateConstants<ShaderType, ConstantType, T>(
+          &m_state, StartRegister, pConstantData, Count);
 
         return D3D_OK;
       };
 
-      return ProgramType == DxsoProgramTypes::VertexShader
+      return ShaderType == D3D9ShaderType::VertexShader
         ? SetHelper(m_captures.vsConsts)
         : SetHelper(m_captures.psConsts);
     }
 
     HRESULT SetVertexBoolBitfield(uint32_t idx, uint32_t mask, uint32_t bits);
     HRESULT SetPixelBoolBitfield (uint32_t idx, uint32_t mask, uint32_t bits);
-
-    inline bool IsApplying() {
-      return m_applying;
-    }
 
   private:
 
@@ -409,9 +399,7 @@ namespace dxvk {
     D3D9CapturableState  m_state;
     D3D9StateCaptures    m_captures;
 
-    D3D9DeviceState* m_deviceState;
-
-    bool                 m_applying = false;
+    D3D9DeviceState*     m_deviceState;
 
   };
 

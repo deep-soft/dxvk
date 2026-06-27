@@ -46,6 +46,12 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9StateBlock::Capture() {
+    D3D9DeviceLock lock = m_parent->LockDevice();
+
+    // A state block can't capture state while another is being recorded.
+    if (unlikely(m_parent->ShouldRecord()))
+      return D3DERR_INVALIDCALL;
+
     if (m_captures.flags.test(D3D9CapturedStateFlag::VertexDecl))
       SetVertexDeclaration(m_deviceState->vertexDecl.ptr());
 
@@ -56,13 +62,16 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9StateBlock::Apply() {
-    m_applying = true;
+    D3D9DeviceLock lock = m_parent->LockDevice();
+
+    // A state block can't be applied while another is being recorded.
+    if (unlikely(m_parent->ShouldRecord()))
+      return D3DERR_INVALIDCALL;
 
     if (m_captures.flags.test(D3D9CapturedStateFlag::VertexDecl) && m_state.vertexDecl != nullptr)
       m_parent->SetVertexDeclaration(m_state.vertexDecl.ptr());
 
     ApplyOrCapture<D3D9StateFunction::Apply, false>();
-    m_applying = false;
 
     return D3D_OK;
   }
@@ -182,7 +191,9 @@ namespace dxvk {
     if (Index >= m_state.lights.size())
       m_state.lights.resize(Index + 1);
 
-    m_state.lights[Index] = *pLight;
+    auto& light = m_state.lights[Index];
+    light.isValid = true;
+    light.light = *pLight;
 
     m_captures.flags.set(D3D9CapturedStateFlag::Lights);
     return D3D_OK;
@@ -193,24 +204,13 @@ namespace dxvk {
     if (unlikely(Index >= m_state.lights.size()))
       m_state.lights.resize(Index + 1);
 
-    if (unlikely(!m_state.lights[Index]))
-      m_state.lights[Index] = DefaultLight;
+    // Apply default light on enable, but not disable.
+    // No idea if this is correct, but matches the old logic.
+    auto& light = m_state.lights[Index];
+    light.isEnabled = bool(Enable);
 
-    if (m_state.IsLightEnabled(Index) == !!Enable)
-      return D3D_OK;
-
-    uint32_t searchIndex = UINT32_MAX;
-    uint32_t setIndex    = Index;
-
-    if (!Enable)
-      std::swap(searchIndex, setIndex);
-
-    for (auto& idx : m_state.enabledLightIndices) {
-      if (idx == searchIndex) {
-        idx = setIndex;
-        break;
-      }
-    }
+    if (Enable)
+      light.isValid = true;
 
     m_captures.lightEnabledChanges.set(Index, true);
     m_captures.flags.set(D3D9CapturedStateFlag::Lights);
@@ -239,15 +239,6 @@ namespace dxvk {
     m_captures.flags.set(D3D9CapturedStateFlag::TextureStages);
     m_captures.textureStages.set(Stage, true);
     m_captures.textureStageStates[Stage].set(Type, true);
-    return D3D_OK;
-  }
-
-
-  HRESULT D3D9StateBlock::MultiplyStateTransform(uint32_t idx, const D3DMATRIX* pMatrix) {
-    m_state.transforms[idx] = m_state.transforms[idx] * ConvertMatrix(pMatrix);
-
-    m_captures.flags.set(D3D9CapturedStateFlag::Transforms);
-    m_captures.transforms.set(idx, true);
     return D3D_OK;
   }
 
@@ -283,7 +274,7 @@ namespace dxvk {
     const float* pConstantData,
           UINT   Vector4fCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::VertexShader,
+      D3D9ShaderType::VertexShader,
       D3D9ConstantType::Float>(
         StartRegister,
         pConstantData,
@@ -296,7 +287,7 @@ namespace dxvk {
     const int* pConstantData,
           UINT Vector4iCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::VertexShader,
+      D3D9ShaderType::VertexShader,
       D3D9ConstantType::Int>(
         StartRegister,
         pConstantData,
@@ -309,7 +300,7 @@ namespace dxvk {
     const BOOL* pConstantData,
           UINT  BoolCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::VertexShader,
+      D3D9ShaderType::VertexShader,
       D3D9ConstantType::Bool>(
         StartRegister,
         pConstantData,
@@ -322,7 +313,7 @@ namespace dxvk {
     const float* pConstantData,
           UINT   Vector4fCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::PixelShader,
+      D3D9ShaderType::PixelShader,
       D3D9ConstantType::Float>(
         StartRegister,
         pConstantData,
@@ -335,7 +326,7 @@ namespace dxvk {
     const int* pConstantData,
           UINT Vector4iCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::PixelShader,
+      D3D9ShaderType::PixelShader,
       D3D9ConstantType::Int>(
         StartRegister,
         pConstantData,
@@ -348,7 +339,7 @@ namespace dxvk {
     const BOOL* pConstantData,
           UINT  BoolCount) {
     return SetShaderConstants<
-      DxsoProgramTypes::PixelShader,
+      D3D9ShaderType::PixelShader,
       D3D9ConstantType::Bool>(
         StartRegister,
         pConstantData,
@@ -440,7 +431,7 @@ namespace dxvk {
   void D3D9StateBlock::CapturePixelSamplerStates() {
     m_captures.flags.set(D3D9CapturedStateFlag::SamplerStates);
 
-    for (uint32_t i = 0; i < caps::MaxTexturesPS + 1; i++) {
+    for (uint32_t i = 0; i < FirstVSSamplerSlot; i++) {
       m_captures.samplers.set(i, true);
 
       m_captures.samplerStates[i].set(D3DSAMP_ADDRESSU, true);
@@ -523,7 +514,7 @@ namespace dxvk {
   void D3D9StateBlock::CaptureVertexSamplerStates() {
     m_captures.flags.set(D3D9CapturedStateFlag::SamplerStates);
 
-    for (uint32_t i = caps::MaxTexturesPS + 1; i < SamplerCount; i++) {
+    for (uint32_t i = FirstVSSamplerSlot; i < SamplerCount; i++) {
       m_captures.samplers.set(i, true);
       m_captures.samplerStates[i].set(D3DSAMP_DMAPOFFSET, true);
     }

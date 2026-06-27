@@ -2,9 +2,12 @@
 
 #include <array>
 
+#include "d3d11_blend.h"
 #include "d3d11_buffer.h"
+#include "d3d11_depth_stencil.h"
 #include "d3d11_input_layout.h"
 #include "d3d11_query.h"
+#include "d3d11_rasterizer.h"
 #include "d3d11_sampler.h"
 #include "d3d11_shader.h"
 #include "d3d11_state.h"
@@ -14,7 +17,7 @@
 #include "d3d11_view_uav.h"
 
 namespace dxvk {
-  
+
   /**
    * \brief Per-stage state
    *
@@ -26,8 +29,8 @@ namespace dxvk {
 
   public:
 
-          T& operator [] (DxbcProgramType type)       { return m_state[uint32_t(type)]; }
-    const T& operator [] (DxbcProgramType type) const { return m_state[uint32_t(type)]; }
+          T& operator [] (D3D11ShaderType type)       { return m_state[uint32_t(type)]; }
+    const T& operator [] (D3D11ShaderType type) const { return m_state[uint32_t(type)]; }
 
     /**
      * \brief Calls reset method on all objects
@@ -101,7 +104,7 @@ namespace dxvk {
    * Stores bound samplers.
    */
   struct D3D11ShaderStageSamplerBinding {
-    std::array<D3D11SamplerState*, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> samplers = { };
+    std::array<Com<D3D11SamplerState, false>, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> samplers = { };
 
     uint32_t maxCount = 0;
 
@@ -189,8 +192,8 @@ namespace dxvk {
     D3D11RenderTargetViewBinding      rtvs  = { };
     Com<D3D11DepthStencilView, false> dsv   = { };
     
-    D3D11BlendState*        cbState = nullptr;
-    D3D11DepthStencilState* dsState = nullptr;
+    Com<D3D11BlendState, false>        cbState = nullptr;
+    Com<D3D11DepthStencilState, false> dsState = nullptr;
     
     FLOAT blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
@@ -199,10 +202,11 @@ namespace dxvk {
     UINT  stencilRef     = D3D11_DEFAULT_STENCIL_REFERENCE;
 
     UINT  maxRtv         = 0u;
+    UINT  minUav         = D3D11_1_UAV_SLOT_COUNT;
     UINT  maxUav         = 0u;
 
     void reset() {
-      for (uint32_t i = 0; i < maxUav; i++)
+      for (uint32_t i = minUav; i < maxUav; i++)
         uavs[i] = nullptr;
 
       for (uint32_t i = 0; i < maxRtv; i++)
@@ -220,8 +224,9 @@ namespace dxvk {
       sampleMask = D3D11_DEFAULT_SAMPLE_MASK;
       stencilRef = D3D11_DEFAULT_STENCIL_REFERENCE;
 
-      maxRtv = 0;
-      maxUav = 0;
+      maxRtv = 0u;
+      minUav = D3D11_1_UAV_SLOT_COUNT;
+      maxUav = 0u;
     }
   };
   
@@ -232,12 +237,12 @@ namespace dxvk {
    * argument and draw count buffer.
    */
   struct D3D11ContextStateID {
-    Com<D3D11Buffer, false> argBuffer = nullptr;
-    Com<D3D11Buffer, false> cntBuffer = nullptr;
+    uint64_t argBufferCookie = 0u;
+    uint64_t cntBufferCookie = 0u;
 
     void reset() {
-      argBuffer = nullptr;
-      cntBuffer = nullptr;
+      argBufferCookie = 0u;
+      cntBufferCookie = 0u;
     }
   };
 
@@ -253,7 +258,7 @@ namespace dxvk {
     std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports = { };
     std::array<D3D11_RECT,     D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors  = { };
     
-    D3D11RasterizerState* state = nullptr;
+    Com<D3D11RasterizerState, false> state;
 
     void reset() {
       for (uint32_t i = 0; i < numViewports; i++)
@@ -302,6 +307,49 @@ namespace dxvk {
       predicateValue = false;
     }
   };
+
+
+  /**
+   * \brief Lazy binding state
+   *
+   * Keeps track of what state needs to be
+   * re-applied to the context.
+   */
+  struct D3D11LazyBindings {
+    D3D11ShaderTypeFlags shadersUsed = 0u;
+    D3D11ShaderTypeFlags shadersDirty = 0u;
+    D3D11ShaderTypeFlags graphicsUavShaders = 0u;
+
+    D3D11ShaderStageState<D3D11BindingMask> bindingsUsed;
+    D3D11ShaderStageState<D3D11BindingMask> bindingsDirty;
+
+    void reset() {
+      shadersUsed = 0u;
+      shadersDirty = 0u;
+      graphicsUavShaders = 0u;
+
+      bindingsUsed.reset();
+      bindingsDirty.reset();
+    }
+  };
+
+
+  struct D3D11ClassInstanceState {
+    static constexpr uint32_t MaxInstances = 256u;
+
+    uint32_t instanceCount = 0u;
+    std::array<Com<D3D11ClassInstance, false>, MaxInstances> instances;
+
+    void reset() {
+      for (uint32_t i = 0u; i < instanceCount; i++)
+        instances[i] = nullptr;
+
+      instanceCount = 0u;
+    }
+  };
+
+  using D3D11ClassInstances = D3D11ShaderStageState<D3D11ClassInstanceState>;
+
   
   /**
    * \brief Context state
@@ -325,6 +373,9 @@ namespace dxvk {
     D3D11SrvBindings    srv;
     D3D11UavBindings    uav;
     D3D11SamplerBindings samplers;
+
+    D3D11LazyBindings   lazy;
+    D3D11ClassInstances instances;
   };
 
   /**
@@ -342,7 +393,7 @@ namespace dxvk {
    * \brief Maximum used binding numbers for all context state
    */
   struct D3D11MaxUsedBindings {
-    std::array<D3D11MaxUsedStageBindings, 6> stages;
+    std::array<D3D11MaxUsedStageBindings, D3D11ShaderTypeCount> stages;
     uint32_t  vbCount;
     uint32_t  soCount;
   };

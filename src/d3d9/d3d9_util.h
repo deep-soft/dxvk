@@ -7,7 +7,6 @@
 
 #include "d3d9_format.h"
 
-#include "../dxso/dxso_common.h"
 #include "../dxvk/dxvk_device.h"
 
 #include "../util/util_matrix.h"
@@ -20,14 +19,6 @@ namespace dxvk {
   struct D3D9ShaderMasks {
     uint32_t samplerMask;
     uint32_t rtMask;
-  };
-
-  static constexpr D3D9ShaderMasks FixedFunctionMask =
-    { 0b1111111, 0b1 };
-
-  struct D3D9MipFilter {
-    bool                MipsEnabled;
-    VkSamplerMipmapMode MipFilter;
   };
 
   struct D3D9BlendState {
@@ -49,6 +40,11 @@ namespace dxvk {
     }
   }
 
+  /**
+   * @brief Returns whether or not the sampler index is valid
+   *
+   * @param Sampler Sampler index (according to the API)
+   */
   inline bool InvalidSampler(DWORD Sampler) {
     if (Sampler >= caps::MaxTexturesPS && Sampler < D3DDMAPSAMPLER)
       return true;
@@ -59,6 +55,19 @@ namespace dxvk {
     return false;
   }
 
+  /**
+   * @brief The first sampler that belongs to the vertex shader according to our internal way of storing samplers
+   */
+  constexpr uint32_t FirstVSSamplerSlot = caps::MaxTexturesPS + 1;
+
+  /**
+   * @brief Remaps a sampler index by the API to an internal one
+   *
+   * Remaps the sampler index according to the way the API counts them to how we count and store them internally.
+   *
+   * @param Sampler Sampler index (according to API)
+   * @return DWORD Sampler index (according to our internal way of storing samplers)
+   */
   inline DWORD RemapSamplerState(DWORD Sampler) {
     if (Sampler >= D3DDMAPSAMPLER)
       Sampler = caps::MaxTexturesPS + (Sampler - D3DDMAPSAMPLER);
@@ -66,18 +75,29 @@ namespace dxvk {
     return Sampler;
   }
 
-  inline std::pair<DxsoProgramType, DWORD> RemapStateSamplerShader(DWORD Sampler) {
-    if (Sampler >= caps::MaxTexturesPS + 1)
-      return std::make_pair(DxsoProgramTypes::VertexShader, Sampler - caps::MaxTexturesPS - 1);
 
-    return std::make_pair(DxsoProgramTypes::PixelShader, Sampler);
+  /**
+   * @brief Returns whether the sampler belongs to the vertex shader.
+   *
+   * The displacement map sampler is part of a fixed function feature,
+   * so it does not belong to the vertex shader.
+   * @param Sampler Sampler index (according to our internal way of storing samplers)
+   */
+  constexpr bool IsVSSampler(uint32_t Sampler) {
+    return Sampler >= FirstVSSamplerSlot;
   }
 
-  inline std::pair<DxsoProgramType, DWORD> RemapSamplerShader(DWORD Sampler) {
-    Sampler = RemapSamplerState(Sampler);
-
-    return RemapStateSamplerShader(Sampler);
+  /**
+   * @brief Returns whether the sampler belongs to the pixel shader.
+   *
+   * The displacement map sampler is part of a fixed function feature,
+   * so it does not belong to the pixel shader.
+   * @param Sampler Sampler index (according to our internal way of storing samplers)
+   */
+  constexpr bool IsPSSampler(uint32_t Sampler) {
+    return Sampler <= caps::MaxTexturesPS;
   }
+
 
   template <typename T, typename J>
   void CastRefPrivate(J* ptr, bool AddRef) {
@@ -95,7 +115,6 @@ namespace dxvk {
           ID3DBlob** ppDisassembly);
 
   HRESULT DecodeMultiSampleType(
-    const Rc<DxvkDevice>&           pDevice,
           D3DMULTISAMPLE_TYPE       MultiSample,
           DWORD                     MultisampleQuality,
           VkSampleCountFlagBits*    pSampleCount);
@@ -110,11 +129,11 @@ namespace dxvk {
     return srgb ? srgbFormat : format;
   }
 
-  constexpr VkShaderStageFlagBits GetShaderStage(DxsoProgramType ProgramType) {
-    switch (ProgramType) {
-      case DxsoProgramTypes::VertexShader:  return VK_SHADER_STAGE_VERTEX_BIT;
-      case DxsoProgramTypes::PixelShader:   return VK_SHADER_STAGE_FRAGMENT_BIT;
-      default:                              return VkShaderStageFlagBits(0);
+  constexpr VkShaderStageFlagBits GetShaderStage(D3D9ShaderType ShaderType) {
+    switch (ShaderType) {
+      case D3D9ShaderType::VertexShader: return VK_SHADER_STAGE_VERTEX_BIT;
+      case D3D9ShaderType::PixelShader:  return VK_SHADER_STAGE_FRAGMENT_BIT;
+      default:                           return VkShaderStageFlagBits(0);
     }
   }
 
@@ -146,13 +165,26 @@ namespace dxvk {
 
   VkBlendOp DecodeBlendOp(D3DBLENDOP BlendOp);
 
-  VkFilter DecodeFilter(D3DTEXTUREFILTERTYPE Filter);
+  inline VkFilter DecodeFilter(D3DTEXTUREFILTERTYPE Filter) {
+    return Filter > D3DTEXF_POINT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  }
 
-  D3D9MipFilter DecodeMipFilter(D3DTEXTUREFILTERTYPE Filter);
+  inline VkSamplerMipmapMode DecodeMipFilter(D3DTEXTUREFILTERTYPE Filter) {
+    return Filter > D3DTEXF_POINT ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  }
 
-  bool IsAnisotropic(D3DTEXTUREFILTERTYPE Filter);
+  inline VkSamplerAddressMode DecodeAddressMode(D3DTEXTUREADDRESS Mode) {
+    constexpr uint32_t Lut =
+      (uint32_t(VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT)      << (3 * D3DTADDRESS_MIRROR)) |
+      (uint32_t(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)        << (3 * D3DTADDRESS_CLAMP)) |
+      (uint32_t(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)      << (3 * D3DTADDRESS_BORDER)) |
+      (uint32_t(VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE) << (3 * D3DTADDRESS_MIRRORONCE));
 
-  VkSamplerAddressMode DecodeAddressMode(D3DTEXTUREADDRESS Mode);
+    // VK_SAMPLER_ADDRESS_MODE_REPEAT has a value of 0, so we
+    // get it for free if the app passes an unsupported value
+    uint32_t shift = std::min(uint32_t(Mode) * 3u, 31u);
+    return VkSamplerAddressMode((uint32_t(Lut) >> shift) & 0x7u);
+  }
 
   VkCompareOp DecodeCompareOp(D3DCMPFUNC Func);
 
@@ -202,13 +234,6 @@ namespace dxvk {
     return count;
   }
 
-  bool IsDepthFormat(D3D9Format Format);
-
-  bool IsDepthStencilFormat(D3D9Format Format);
-
-  bool IsLockableDepthStencilFormat(D3D9Format Format);
-
-
   inline bool IsPoolManaged(D3DPOOL Pool) {
     return Pool == D3DPOOL_MANAGED || Pool == D3DPOOL_MANAGED_EX;
   }
@@ -235,6 +260,9 @@ namespace dxvk {
            uint32_t(offsets[1].y) > extent.height;
   }
 
+  /**
+   * @brief Mirrors D3DTEXTURESTAGESTATETYPE but starts at 0
+   */
   enum D3D9TextureStageStateTypes : uint32_t
   {
       DXVK_TSS_COLOROP        =  0,
@@ -264,6 +292,12 @@ namespace dxvk {
   constexpr uint32_t DXVK_TSS_TCI_CAMERASPACEREFLECTIONVECTOR   = 0x00030000;
   constexpr uint32_t DXVK_TSS_TCI_SPHEREMAP                     = 0x00040000;
 
+  /**
+   * @brief Remaps a texture stage type by the API to an internal one
+   *
+   * @param Type Texture stage type according to the API
+   * @return D3D9TextureStageStateTypes Texture stage type according to our internal way of storing them
+   */
   inline D3D9TextureStageStateTypes RemapTextureStageStateType(D3DTEXTURESTAGESTATETYPE Type) {
     return D3D9TextureStageStateTypes(Type - 1);
   }
@@ -284,6 +318,9 @@ inline bool operator != (const D3DVIEWPORT9& a, const D3DVIEWPORT9& b) {
   return !(a == b);
 }
 
+
+// Missing in some versions of mingw headers
+#ifndef _MSC_VER
 inline bool operator == (const RECT& a, const RECT& b) {
   return a.left   == b.left  &&
          a.right  == b.right &&
@@ -294,6 +331,7 @@ inline bool operator == (const RECT& a, const RECT& b) {
 inline bool operator != (const RECT& a, const RECT& b) {
   return !(a == b);
 }
+#endif /* _MSC_VER */
 
 inline bool operator == (const POINT& a, const POINT& b) {
   return a.x == b.x && a.y == b.y;

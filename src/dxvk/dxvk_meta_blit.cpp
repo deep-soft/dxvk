@@ -1,345 +1,471 @@
+#include "dxvk_shader_builtin.h"
 #include "dxvk_device.h"
 #include "dxvk_meta_blit.h"
-
-#include <dxvk_fullscreen_geom.h>
-#include <dxvk_fullscreen_vert.h>
-#include <dxvk_fullscreen_layer_vert.h>
-
-#include <dxvk_blit_frag_1d.h>
-#include <dxvk_blit_frag_2d.h>
-#include <dxvk_blit_frag_3d.h>
+#include "dxvk_util.h"
 
 namespace dxvk {
+
+  struct DxvkMetaBlitPushArgs {
+    ir::SsaDef srcCoord0 = { };
+    ir::SsaDef srcCoord1 = { };
+    ir::SsaDef sampler = { };
+    ir::SsaDef layerIndex = { };
+    ir::SsaDef layerCount = { };
+  };
+
+
+  static DxvkMetaBlitPushArgs loadBlitPushArgs(ir::Builder& builder, DxvkBuiltInShader& helper) {
+    ir::BasicType coordType(ir::ScalarType::eU32, 3u);
+
+    DxvkMetaBlitPushArgs result = { };
+    result.srcCoord0 = helper.declarePushData(builder, coordType, offsetof(DxvkMetaBlit::Args, srcCoord0), "coord0");
+    result.srcCoord1 = helper.declarePushData(builder, coordType, offsetof(DxvkMetaBlit::Args, srcCoord1), "coord1");
+    result.sampler = helper.declareSampler(builder, offsetof(DxvkMetaBlit::Args, sampler), "filter");
+    result.layerIndex = helper.declarePushData(builder, ir::ScalarType::eU32, offsetof(DxvkMetaBlit::Args, layerIndex), "layerIndex");
+    result.layerCount = helper.declarePushData(builder, ir::ScalarType::eU32, offsetof(DxvkMetaBlit::Args, layerCount), "layerCount");
+    return result;
+  }
+
   
-  DxvkMetaBlitRenderPass::DxvkMetaBlitRenderPass(
-    const Rc<DxvkDevice>&       device,
-    const Rc<DxvkImage>&        dstImage,
-    const Rc<DxvkImage>&        srcImage,
-    const VkImageBlit&          region,
-    const VkComponentMapping&   mapping)
-  : m_vkd         (device->vkd()),
-    m_dstImage    (dstImage),
-    m_srcImage    (srcImage),
-    m_region      (region),
-    m_dstView     (createDstView()),
-    m_srcView     (createSrcView(mapping)) {
-    
-  }
+  DxvkMetaBlitObjects::DxvkMetaBlitObjects(DxvkDevice* device)
+  : m_device(device) {
 
-
-  DxvkMetaBlitRenderPass::~DxvkMetaBlitRenderPass() {
-    m_vkd->vkDestroyImageView(m_vkd->device(), m_dstView, nullptr);
-    m_vkd->vkDestroyImageView(m_vkd->device(), m_srcView, nullptr);
-  }
-
-
-  VkImageViewType DxvkMetaBlitRenderPass::viewType() const {
-    static const std::array<VkImageViewType, 3> viewTypes = {{
-      VK_IMAGE_VIEW_TYPE_1D_ARRAY,
-      VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-      VK_IMAGE_VIEW_TYPE_3D,
-    }};
-
-    return viewTypes.at(uint32_t(m_srcImage->info().type));
-  }
-
-
-  uint32_t DxvkMetaBlitRenderPass::framebufferLayerIndex() const {
-    uint32_t result = m_region.dstSubresource.baseArrayLayer;
-
-    if (m_dstImage->info().type == VK_IMAGE_TYPE_3D)
-      result = std::min(m_region.dstOffsets[0].z, m_region.dstOffsets[1].z);
-
-    return result;
-  }
-
-
-  uint32_t DxvkMetaBlitRenderPass::framebufferLayerCount() const {
-    uint32_t result = m_region.dstSubresource.layerCount;
-
-    if (m_dstImage->info().type == VK_IMAGE_TYPE_3D) {
-      uint32_t minZ = std::min(m_region.dstOffsets[0].z, m_region.dstOffsets[1].z);
-      uint32_t maxZ = std::max(m_region.dstOffsets[0].z, m_region.dstOffsets[1].z);
-      result = maxZ - minZ;
-    }
-
-    return result;
-  }
-
-
-  VkImageView DxvkMetaBlitRenderPass::createDstView() {
-    std::array<VkImageViewType, 3> viewTypes = {{
-      VK_IMAGE_VIEW_TYPE_1D_ARRAY,
-      VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-      VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-    }};
-
-    VkImageViewUsageCreateInfo usageInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO };
-    usageInfo.usage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-    VkImageViewCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usageInfo };
-    info.image            = m_dstImage->handle();
-    info.viewType         = viewTypes.at(uint32_t(m_dstImage->info().type));
-    info.format           = m_dstImage->info().format;
-    info.components       = VkComponentMapping();
-    info.subresourceRange = vk::makeSubresourceRange(m_region.dstSubresource);
-
-    if (m_dstImage->info().type) {
-      info.subresourceRange.baseArrayLayer = framebufferLayerIndex();
-      info.subresourceRange.layerCount     = framebufferLayerCount();
-    }
-
-    VkImageView result;
-    if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitRenderPass: Failed to create image view");
-    return result;
-  }
-
-
-  VkImageView DxvkMetaBlitRenderPass::createSrcView(const VkComponentMapping& mapping) {
-    VkImageViewUsageCreateInfo usageInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO };
-    usageInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT;
-
-    VkImageViewCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usageInfo };
-    info.image            = m_srcImage->handle();
-    info.viewType         = this->viewType();
-    info.format           = m_srcImage->info().format;
-    info.components       = mapping;
-    info.subresourceRange = vk::makeSubresourceRange(m_region.srcSubresource);
-
-    VkImageView result;
-    if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitRenderPass: Failed to create image view");
-    return result;
-  }
-
-
-
-
-  DxvkMetaBlitObjects::DxvkMetaBlitObjects(const DxvkDevice* device)
-  : m_vkd         (device->vkd()),
-    m_samplerCopy (createSampler(VK_FILTER_NEAREST)),
-    m_samplerBlit (createSampler(VK_FILTER_LINEAR)),
-    m_shaderFrag1D(createShaderModule(dxvk_blit_frag_1d)),
-    m_shaderFrag2D(createShaderModule(dxvk_blit_frag_2d)),
-    m_shaderFrag3D(createShaderModule(dxvk_blit_frag_3d)) {
-    if (device->features().vk12.shaderOutputLayer) {
-      m_shaderVert = createShaderModule(dxvk_fullscreen_layer_vert);
-    } else {
-      m_shaderVert = createShaderModule(dxvk_fullscreen_vert);
-      m_shaderGeom = createShaderModule(dxvk_fullscreen_geom);
-    }
   }
 
 
   DxvkMetaBlitObjects::~DxvkMetaBlitObjects() {
-    for (const auto& pair : m_pipelines) {
-      m_vkd->vkDestroyPipeline(m_vkd->device(), pair.second.pipeHandle, nullptr);
-      m_vkd->vkDestroyPipelineLayout(m_vkd->device(), pair.second.pipeLayout, nullptr);
-      m_vkd->vkDestroyDescriptorSetLayout (m_vkd->device(), pair.second.dsetLayout, nullptr);
-    }
-    
-    m_vkd->vkDestroyShaderModule(m_vkd->device(), m_shaderFrag3D, nullptr);
-    m_vkd->vkDestroyShaderModule(m_vkd->device(), m_shaderFrag2D, nullptr);
-    m_vkd->vkDestroyShaderModule(m_vkd->device(), m_shaderFrag1D, nullptr);
-    m_vkd->vkDestroyShaderModule(m_vkd->device(), m_shaderGeom, nullptr);
-    m_vkd->vkDestroyShaderModule(m_vkd->device(), m_shaderVert, nullptr);
-    
-    m_vkd->vkDestroySampler(m_vkd->device(), m_samplerBlit, nullptr);
-    m_vkd->vkDestroySampler(m_vkd->device(), m_samplerCopy, nullptr);
+    auto vk = m_device->vkd();
+
+    for (const auto& p : m_pipelines)
+      vk->vkDestroyPipeline(vk->device(), p.second.pipeline, nullptr);
   }
-  
-  
-  DxvkMetaBlitPipeline DxvkMetaBlitObjects::getPipeline(
-          VkImageViewType       viewType,
-          VkFormat              viewFormat,
-          VkSampleCountFlagBits samples) {
-    std::lock_guard<dxvk::mutex> lock(m_mutex);
-    
-    DxvkMetaBlitPipelineKey key;
-    key.viewType   = viewType;
-    key.viewFormat = viewFormat;
-    key.samples    = samples;
-    
+
+
+  DxvkMetaBlit DxvkMetaBlitObjects::getPipeline(const DxvkMetaBlit::Key& key) {
+    std::lock_guard lock(m_mutex);
+
     auto entry = m_pipelines.find(key);
+
     if (entry != m_pipelines.end())
       return entry->second;
-    
-    DxvkMetaBlitPipeline pipeline = this->createPipeline(key);
+
+    auto pipeline = createPipeline(key);
     m_pipelines.insert({ key, pipeline });
     return pipeline;
   }
-  
-  
-  VkSampler DxvkMetaBlitObjects::getSampler(VkFilter filter) {
-    return filter == VK_FILTER_NEAREST
-      ? m_samplerCopy
-      : m_samplerBlit;
+
+
+  const DxvkPipelineLayout* DxvkMetaBlitObjects::createPipelineLayout() const {
+    DxvkDescriptorSetLayoutBinding binding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u,
+      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT);
+
+    return m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap,
+      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT,
+      sizeof(DxvkMetaBlit::Args), 1, &binding);
   }
-  
-  
-  VkSampler DxvkMetaBlitObjects::createSampler(VkFilter filter) const {
-    VkSamplerCreateInfo info = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    info.magFilter              = filter;
-    info.minFilter              = filter;
-    info.mipmapMode             = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    info.addressModeU           = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.addressModeV           = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.addressModeW           = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.borderColor            = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    
-    VkSampler result = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateSampler(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create sampler");
-    return result;
-  }
-  
-  
-  VkShaderModule DxvkMetaBlitObjects::createShaderModule(const SpirvCodeBuffer& code) const {
-    VkShaderModuleCreateInfo info = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    info.codeSize               = code.size();
-    info.pCode                  = code.data();
-    
-    VkShaderModule result = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create shader module");
-    return result;
-  }
-  
-  
-  DxvkMetaBlitPipeline DxvkMetaBlitObjects::createPipeline(
-    const DxvkMetaBlitPipelineKey& key) {
-    DxvkMetaBlitPipeline pipe;
-    pipe.dsetLayout = this->createDescriptorSetLayout(key.viewType);
-    pipe.pipeLayout = this->createPipelineLayout(pipe.dsetLayout);
-    pipe.pipeHandle = this->createPipeline(pipe.pipeLayout,
-      key.viewType, key.viewFormat, key.samples);
-    return pipe;
-  }
-  
-  
-  VkDescriptorSetLayout DxvkMetaBlitObjects::createDescriptorSetLayout(
-          VkImageViewType             viewType) const {
-    VkDescriptorSetLayoutBinding binding = { 0,
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT };
-    
-    VkDescriptorSetLayoutCreateInfo info = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    info.bindingCount           = 1;
-    info.pBindings              = &binding;
-    
-    VkDescriptorSetLayout result = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create descriptor set layout");
-    return result;
-  }
-  
-  
-  VkPipelineLayout DxvkMetaBlitObjects::createPipelineLayout(
-          VkDescriptorSetLayout       descriptorSetLayout) const {
-    VkPushConstantRange pushRange = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(DxvkMetaBlitPushConstants) };
-    
-    VkPipelineLayoutCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    info.setLayoutCount         = 1;
-    info.pSetLayouts            = &descriptorSetLayout;
-    info.pushConstantRangeCount = 1;
-    info.pPushConstantRanges    = &pushRange;
-    
-    VkPipelineLayout result = VK_NULL_HANDLE;
-    if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create pipeline layout");
-    return result;
-  }
-  
-  
-  VkPipeline DxvkMetaBlitObjects::createPipeline(
-          VkPipelineLayout            pipelineLayout,
-          VkImageViewType             imageViewType,
-          VkFormat                    format,
-          VkSampleCountFlagBits       samples) const {
-    std::array<VkPipelineShaderStageCreateInfo, 3> stages;
-    uint32_t stageCount = 0;
-    
-    stages[stageCount++] = VkPipelineShaderStageCreateInfo {
-      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-      VK_SHADER_STAGE_VERTEX_BIT, m_shaderVert, "main" };
-    
-    if (m_shaderGeom) {
-      stages[stageCount++] = VkPipelineShaderStageCreateInfo {
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-        VK_SHADER_STAGE_GEOMETRY_BIT, m_shaderGeom, "main" };
+
+
+  std::vector<uint32_t> DxvkMetaBlitObjects::createVs(const DxvkMetaBlit::Key& key, VkImageAspectFlagBits aspect, const DxvkPipelineLayout* layout) {
+    dxbc_spv::ir::Builder builder;
+
+    DxvkBuiltInShader helper(m_device, layout, getName(key, "vs"));
+    DxvkBuiltInVertexShader vertex = helper.buildFullscreenVertexShader(builder);
+
+    ir::SsaDef srv = helper.declareImageSrv(builder, 0u, "srcImage",
+      key.srcViewType, key.dstFormat, aspect, key.srcSamples);
+
+    ir::ResourceKind srcKind = helper.determineResourceKind(key.srcViewType, key.srcSamples);
+
+    // 3D blits are instanced, so forward the instance ID as the layer index.
+    // Arrayed images will use multiple draw calls with a push constant index
+    // instead, which we will ignore in the 3D case.
+    DxvkMetaBlitPushArgs pushArgs = loadBlitPushArgs(builder, helper);
+
+    ir::SsaDef layer = srcKind == ir::ResourceKind::eImage3D
+      ? vertex.instanceIndex : pushArgs.layerIndex;
+
+    helper.exportBuiltIn(builder, ir::BuiltIn::eLayerIndex, layer);
+
+    // Compute texture coordinates to forward to the pixel shader.
+    // For 3D images, use the layer index to compute the Z coord.
+    uint32_t coordDim = ir::resourceCoordComponentCount(srcKind);
+
+    ir::BasicType coordTypeU(ir::ScalarType::eU32, coordDim);
+    ir::BasicType coordTypeF(ir::ScalarType::eF32, coordDim);
+
+    ir::SsaDef coordZ = builder.add(ir::Op::ConvertItoF(ir::ScalarType::eF32, layer));
+    coordZ = builder.add(ir::Op::FAdd(ir::ScalarType::eF32, coordZ, builder.makeConstant(0.5f)));
+    coordZ = builder.add(ir::Op::FDiv(ir::ScalarType::eF32, coordZ,
+      builder.add(ir::Op::ConvertItoF(ir::ScalarType::eF32, pushArgs.layerCount))));
+
+    ir::SsaDef coord = helper.emitConcatVector(builder, vertex.coord, coordZ);
+    coord = helper.emitExtractVector(builder, coord, 0u, coordDim);
+
+    // Scale normalized coordinate by the source coordinate points
+    ir::SsaDef srcCoord0 = helper.emitExtractVector(builder, pushArgs.srcCoord0, 0u, coordDim);
+    ir::SsaDef srcCoord1 = helper.emitExtractVector(builder, pushArgs.srcCoord1, 0u, coordDim);
+
+    srcCoord0 = builder.add(ir::Op::ConvertItoF(coordTypeF, srcCoord0));
+    srcCoord1 = builder.add(ir::Op::ConvertItoF(coordTypeF, srcCoord1));
+
+    coord = builder.add(ir::Op::FMad(coordTypeF, coord,
+      builder.add(ir::Op::FSub(coordTypeF, srcCoord1, srcCoord0)), srcCoord0));
+
+    // The resolve shader expects raw pixel coordinates, the regular sampling
+    // path requires normalized coordinates. Divide by the image size in that
+    // case in order to keep the shader interface consistent.
+    if (!ir::resourceIsMultisampled(srcKind)) {
+      ir::Type infoType = ir::Type()
+        .addStructMember(coordTypeU)
+        .addStructMember(ir::ScalarType::eU32);
+
+      ir::SsaDef size = builder.add(ir::Op::ImageQuerySize(infoType, srv, builder.makeConstant(0u)));
+      size = builder.add(ir::Op::CompositeExtract(coordTypeU, size, builder.makeConstant(0u)));
+      size = builder.add(ir::Op::Op::ConvertItoF(coordTypeF, size));
+
+      coord = builder.add(ir::Op::FDiv(coordTypeF, coord, size));
     }
 
-    VkShaderModule psModule = VK_NULL_HANDLE;
+    helper.exportOutput(builder, 0u, coord, "coord");
+    return helper.buildShader(builder);
+  }
 
-    switch (imageViewType) {
-      case VK_IMAGE_VIEW_TYPE_1D_ARRAY: psModule = m_shaderFrag1D; break;
-      case VK_IMAGE_VIEW_TYPE_2D_ARRAY: psModule = m_shaderFrag2D; break;
-      case VK_IMAGE_VIEW_TYPE_3D:       psModule = m_shaderFrag3D; break;
-      default: throw DxvkError("DxvkMetaBlitObjects: Invalid view type");
+
+  std::vector<uint32_t> DxvkMetaBlitObjects::createPsSimple(const DxvkMetaBlit::Key& key, VkImageAspectFlagBits aspect, const DxvkPipelineLayout* layout) {
+    dxbc_spv::ir::Builder builder;
+
+    DxvkBuiltInShader helper(m_device, layout, getName(key, "ps"));
+    helper.buildPixelShader(builder);
+
+    ir::SsaDef srv = helper.declareImageSrv(builder, 0u, "srcImage",
+      key.srcViewType, key.dstFormat, aspect, key.srcSamples);
+
+    DxvkMetaBlitPushArgs pushArgs = loadBlitPushArgs(builder, helper);
+
+    // Load texture coordinates that we can feed into the sampler operation
+    // as-is. Use array layer from push data for arrayed inputs as necessary.
+    ir::ResourceKind srcKind = helper.determineResourceKind(key.srcViewType, key.srcSamples);
+
+    uint32_t coordDim = ir::resourceCoordComponentCount(srcKind);
+    ir::BasicType coordType(ir::ScalarType::eF32, coordDim);
+
+    ir::SsaDef coord = helper.declareInput(builder, coordType, 0u, "coord");
+
+    ir::SsaDef layer = ir::resourceIsLayered(srcKind)
+      ? builder.add(ir::Op::ConvertItoF(ir::ScalarType::eF32, pushArgs.layerIndex))
+      : ir::SsaDef();
+
+    // Sample input texture at LOD 0 with the appropriate component type.
+    ir::BasicType pixelType(helper.determineSampledType(key.dstFormat, aspect), 4u);
+
+    ir::SsaDef value = builder.add(ir::Op::ImageSample(pixelType,
+      srv, pushArgs.sampler, layer, coord, ir::SsaDef(), builder.makeConstant(0.0f),
+      ir::SsaDef(), ir::SsaDef(), ir::SsaDef(), ir::SsaDef(), ir::SsaDef()));
+
+    value = helper.emitFormatVector(builder, key.dstFormat, value);
+
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      helper.exportBuiltIn(builder, ir::BuiltIn::eDepth, value);
+    else
+      helper.exportOutput(builder, 0u, value, "color");
+
+    return helper.buildShader(builder);
+  }
+
+
+  std::vector<uint32_t> DxvkMetaBlitObjects::createPsResolve(const DxvkMetaBlit::Key& key, VkImageAspectFlagBits aspect, const DxvkPipelineLayout* layout) {
+    dxbc_spv::ir::Builder builder;
+
+    DxvkBuiltInShader helper(m_device, layout, getName(key, "ps"));
+    DxvkBuiltInPixelShader pixel = helper.buildPixelShader(builder);
+
+    ir::SsaDef srv = helper.declareImageSrv(builder, 0u, "srcImage",
+      key.srcViewType, key.dstFormat, aspect, key.srcSamples);
+
+    DxvkMetaBlitPushArgs pushArgs = loadBlitPushArgs(builder, helper);
+
+    // Load interpolated texture coordinates as integers
+    ir::ResourceKind srcKind = helper.determineResourceKind(key.srcViewType, key.srcSamples);
+
+    uint32_t coordDim = ir::resourceCoordComponentCount(srcKind);
+
+    ir::BasicType coordTypeF(ir::ScalarType::eF32, coordDim);
+    ir::BasicType coordTypeI(ir::ScalarType::eI32, coordDim);
+
+    ir::SsaDef coord = helper.declareInput(builder, coordTypeF, 0u, "coord");
+    coord = builder.add(ir::Op::ConvertFtoI(coordTypeI, coord));
+
+    ir::SsaDef layer = ir::resourceIsLayered(srcKind) ? pushArgs.layerIndex : ir::SsaDef();
+
+    // Number of samples to load in per iteration
+    uint32_t sampleIterations = std::max(1u, uint32_t(key.srcSamples) / uint32_t(key.dstSamples));
+
+    ir::SsaDef srcSamplesDef = builder.makeConstant(uint32_t(key.srcSamples));
+    ir::SsaDef dstSamplesDef = builder.makeConstant(uint32_t(key.dstSamples));
+
+    // Base sample index for the current output sample.
+    // This allows partial resolves to be performed.
+    ir::SsaDef baseSample = { };
+
+    if (key.dstSamples > VK_SAMPLE_COUNT_1_BIT) {
+      baseSample = builder.add(ir::Op::UDiv(ir::ScalarType::eU32,
+        builder.add(ir::Op::IMul(ir::ScalarType::eU32, pixel.sampleId, srcSamplesDef)),
+        dstSamplesDef));
     }
-    
-    stages[stageCount++] = VkPipelineShaderStageCreateInfo {
-      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-      VK_SHADER_STAGE_FRAGMENT_BIT, psModule, "main" };
-    
-    std::array<VkDynamicState, 2> dynStates = {{
-      VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
-      VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+
+    // Emit actual sampling loop. Unrolling this should be fine.
+    ir::BasicType pixelType(helper.determineSampledType(key.dstFormat, aspect), 4u);
+
+    ir::SsaDef result = { };
+
+    for (uint32_t i = 0u; i < sampleIterations; i++) {
+      ir::SsaDef sampleIndex = builder.makeConstant(i);
+
+      if (baseSample)
+        sampleIndex = builder.add(ir::Op::IAdd(ir::ScalarType::eU32, baseSample, sampleIndex));
+
+      ir::SsaDef sampleValue = builder.add(ir::Op::ImageLoad(pixelType,
+        srv, ir::SsaDef(), layer, coord, sampleIndex, ir::SsaDef()));
+
+      result = result ? builder.add(ir::Op::FAdd(pixelType, result, sampleValue)) : sampleValue;
+    }
+
+    // Compute average and export
+    ir::SsaDef factor = helper.emitReplicateScalar(builder, pixelType,
+      builder.makeConstant(1.0f / float(sampleIterations)));
+
+    result = builder.add(ir::Op::FMul(pixelType, result, factor));
+    result = helper.emitFormatVector(builder, key.dstFormat, result);
+
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      helper.exportBuiltIn(builder, ir::BuiltIn::eDepth, result);
+    else
+      helper.exportOutput(builder, 0u, result, "color");
+
+    return helper.buildShader(builder);
+  }
+
+
+  std::vector<uint32_t> DxvkMetaBlitObjects::createPsSampleMs(const DxvkMetaBlit::Key& key, VkImageAspectFlagBits aspect, const DxvkPipelineLayout* layout) {
+    dxbc_spv::ir::Builder builder;
+
+    DxvkBuiltInShader helper(m_device, layout, getName(key, "ps"));
+    helper.buildPixelShader(builder);
+
+    ir::SsaDef srv = helper.declareImageSrv(builder, 0u, "srcImage",
+      key.srcViewType, key.dstFormat, aspect, key.srcSamples);
+
+    DxvkMetaBlitPushArgs pushArgs = loadBlitPushArgs(builder, helper);
+
+    // Load interpolated texture coordinates. Use sample interpolation
+    // for the incoming coordinate to get more accurate results.
+    ir::ResourceKind srcKind = helper.determineResourceKind(key.srcViewType, key.srcSamples);
+
+    uint32_t coordDim = ir::resourceCoordComponentCount(srcKind);
+
+    ir::BasicType coordTypeF(ir::ScalarType::eF32, coordDim);
+    ir::BasicType coordTypeI(ir::ScalarType::eI32, coordDim);
+    ir::BasicType coordTypeU(ir::ScalarType::eU32, coordDim);
+
+    ir::SsaDef coord = helper.declareInput(builder, coordTypeF, 0u, "coord", ir::InterpolationMode::eSample);
+    ir::SsaDef layer = ir::resourceIsLayered(srcKind) ? pushArgs.layerIndex : ir::SsaDef();
+
+    // The idea behind this shader is to view the multisampled image as an enlarged,
+    // single-sampled surface and perform linear interpolation on that surface. To
+    // get reasonably accurate results, we need to take sample locations into account
+    // and map each sample to the appropriate coordinate inside the pixel grid.
+    static const std::array<SampleProperties, 5u> s_configs = {{
+      { VK_SAMPLE_COUNT_1_BIT,  1u, 1u, 0x0000000000000000ull },
+      { VK_SAMPLE_COUNT_2_BIT,  2u, 1u, 0x0000000000000001ull },
+      { VK_SAMPLE_COUNT_4_BIT,  2u, 2u, 0x0000000000003210ull },
+      { VK_SAMPLE_COUNT_8_BIT,  4u, 2u, 0x0000000026147035ull },
+      { VK_SAMPLE_COUNT_16_BIT, 4u, 4u, 0xe58b602c3714d9afull },
     }};
-    
-    VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = dynStates.size();
-    dynState.pDynamicStates = dynStates.data();
-    
-    VkPipelineVertexInputStateCreateInfo viState = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    
-    VkPipelineInputAssemblyStateCreateInfo iaState = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    iaState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    iaState.primitiveRestartEnable = VK_FALSE;
-    
-    VkPipelineViewportStateCreateInfo vpState = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    
-    VkPipelineRasterizationStateCreateInfo rsState = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rsState.polygonMode = VK_POLYGON_MODE_FILL;
-    rsState.cullMode = VK_CULL_MODE_NONE;
-    rsState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rsState.lineWidth = 1.0f;
-    
-    uint32_t msMask = 0xFFFFFFFF;
-    VkPipelineMultisampleStateCreateInfo msState = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    msState.rasterizationSamples = samples;
-    msState.pSampleMask = &msMask;
-    
-    VkPipelineColorBlendAttachmentState cbAttachment = { };
-    cbAttachment.colorWriteMask =
-      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    
-    VkPipelineColorBlendStateCreateInfo cbState = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cbState.attachmentCount     = 1;
-    cbState.pAttachments        = &cbAttachment;
 
-    VkPipelineRenderingCreateInfo rtState = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    rtState.colorAttachmentCount = 1;
-    rtState.pColorAttachmentFormats = &format;
+    const SampleProperties* config = s_configs.data();
 
-    VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rtState };
-    info.stageCount             = stageCount;
-    info.pStages                = stages.data();
-    info.pVertexInputState      = &viState;
-    info.pInputAssemblyState    = &iaState;
-    info.pViewportState         = &vpState;
-    info.pRasterizationState    = &rsState;
-    info.pMultisampleState      = &msState;
-    info.pColorBlendState       = &cbState;
-    info.pDynamicState          = &dynState;
-    info.layout                 = pipelineLayout;
-    info.basePipelineIndex      = -1;
-    
-    VkPipeline result = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create graphics pipeline");
+    for (const auto& e : s_configs) {
+      if (e.samples == key.srcSamples)
+        config = &e;
+    }
+
+    // Scale input coordinate by the appropriate amount for the input sample count
+    coord = builder.add(ir::Op::FMul(coordTypeF, coord,
+      builder.makeConstant(float(config->scaleX), float(config->scaleY))));
+
+    // Split coordinate vector into integral and fractional part. Ignore
+    // the latter when using nearest-neighbour filtering.
+    ir::SsaDef coordI = builder.add(ir::Op::ConvertFtoI(coordTypeI, coord));
+    ir::SsaDef coordF = { };
+
+    if (key.resolveMode == DxvkMetaBlitResolveMode::FilterLinear)
+      coordF = builder.add(ir::Op::FFract(coordTypeF, coord));
+
+    // Initialize accumulator value
+    ir::BasicType pixelType(helper.determineSampledType(key.dstFormat, aspect), 4u);
+
+    // When using a linear filter, iterate over all four pixels in the quad,
+    // otherwise only do a single iteration to handle the first pixel. The
+    // loop counter uses a signed type since we feed it into signed arithmetic.
+    int32_t loopIterCount = (key.resolveMode == DxvkMetaBlitResolveMode::FilterLinear) ? 4 : 1;
+
+    // Set up blocks for the loop in reverse order
+    ir::SsaDef mergeBlock = builder.add(ir::Op::Label());
+
+    ir::SsaDef continueBlock = builder.addBefore(mergeBlock, ir::Op::Label());
+
+    ir::SsaDef loopBody = builder.addBefore(continueBlock, ir::Op::Label());
+    ir::SsaDef loopHeader = builder.addBefore(loopBody, ir::Op::LabelLoop(mergeBlock, continueBlock));
+
+    ir::SsaDef loopBranch = builder.addBefore(loopHeader, ir::Op::Branch(loopHeader));
+    ir::SsaDef loopParent = ir::findContainingBlock(builder, loopBranch);
+
+    builder.addAfter(continueBlock, ir::Op::Branch(loopHeader));
+
+    // Declare placeholder phis in loop header
+    builder.setCursor(loopHeader);
+
+    ir::Op countOp = ir::Op::Phi(ir::ScalarType::eI32).addPhi(loopParent, builder.makeConstant(0));
+    ir::Op accumOp = ir::Op::Phi(pixelType).addPhi(loopParent, builder.makeConstantZero(pixelType));
+
+    ir::SsaDef countPhi = builder.add(countOp);
+    ir::SsaDef accumPhi = builder.add(accumOp);
+
+    builder.add(ir::Op::Branch(loopBody));
+
+    // Implement actual loop body.
+    builder.setCursor(loopBody);
+
+    // Offset integer pixel coordinate for the current iteration
+    ir::SsaDef offsetX = builder.add(ir::Op::IAnd(ir::ScalarType::eI32, countPhi, builder.makeConstant(1)));
+    ir::SsaDef offsetY = builder.add(ir::Op::SShr(ir::ScalarType::eI32, countPhi, builder.makeConstant(1)));
+
+    coordI = builder.add(ir::Op::IAdd(coordTypeI, coordI,
+      builder.add(ir::Op::CompositeConstruct(coordTypeI, offsetX, offsetY))));
+
+    // Compute sample index from the LSB of the integer coordinate
+    ir::SsaDef sampleCoord = builder.add(ir::Op::IAnd(coordTypeU,
+      builder.add(ir::Op::Cast(coordTypeU, coordI)),
+      builder.makeConstant(config->scaleX - 1u, config->scaleY - 1u)));
+
+    ir::SsaDef sampleCoordX = builder.add(ir::Op::CompositeExtract(ir::ScalarType::eU32, sampleCoord, builder.makeConstant(0u)));
+    ir::SsaDef sampleCoordY = builder.add(ir::Op::CompositeExtract(ir::ScalarType::eU32, sampleCoord, builder.makeConstant(1u)));
+
+    ir::SsaDef sampleIndex = builder.add(ir::Op::IAdd(ir::ScalarType::eU32, sampleCoordX,
+      builder.add(ir::Op::IMul(ir::ScalarType::eU32, sampleCoordY, builder.makeConstant(config->scaleX)))));
+
+    // Look up actual sample index from the sample mapping for the
+    // given sample count using the flattened sample index.
+    ir::SsaDef sampleMap = builder.makeConstant(config->mapping);
+    ir::SsaDef sampleShift = builder.add(ir::Op::IMul(ir::ScalarType::eU32, sampleIndex, builder.makeConstant(4u)));
+
+    sampleIndex = builder.add(ir::Op::UShr(ir::ScalarType::eU64, sampleMap, sampleShift));
+    sampleIndex = builder.add(ir::Op::ConvertItoI(ir::ScalarType::eU32, sampleIndex));
+    sampleIndex = builder.add(ir::Op::IAnd(ir::ScalarType::eU32, sampleIndex, builder.makeConstant(0xfu)));
+
+    // Compute pixel coordinate from the higher bits of the integer coordinate
+    ir::SsaDef pixelCoord = builder.add(ir::Op::SShr(coordTypeI, coordI,
+      builder.makeConstant(bit::tzcnt(config->scaleX), bit::tzcnt(config->scaleY))));
+
+    // Read sample from the given pixel coordinate
+    ir::SsaDef sampleValue = builder.add(ir::Op::ImageLoad(pixelType,
+      srv, ir::SsaDef(), layer, pixelCoord, sampleIndex, ir::SsaDef()));
+
+    // When performing linear filtering, scale the output value using the fractional
+    // part of the input coordinate. The selection should be resolved at compile time.
+    if (key.resolveMode == DxvkMetaBlitResolveMode::FilterLinear) {
+      ir::SsaDef pickX = builder.add(ir::Op::INe(ir::ScalarType::eBool, offsetX, builder.makeConstant(0)));
+      ir::SsaDef pickY = builder.add(ir::Op::INe(ir::ScalarType::eBool, offsetY, builder.makeConstant(0)));
+
+      ir::SsaDef factorX = builder.add(ir::Op::CompositeExtract(ir::ScalarType::eF32, coordF, builder.makeConstant(0u)));
+      ir::SsaDef factorY = builder.add(ir::Op::CompositeExtract(ir::ScalarType::eF32, coordF, builder.makeConstant(1u)));
+
+      factorX = builder.add(ir::Op::Select(ir::ScalarType::eF32, pickX, factorX,
+        builder.add(ir::Op::FSub(ir::ScalarType::eF32, builder.makeConstant(1.0f), factorX))));
+      factorY = builder.add(ir::Op::Select(ir::ScalarType::eF32, pickY, factorY,
+        builder.add(ir::Op::FSub(ir::ScalarType::eF32, builder.makeConstant(1.0f), factorY))));
+
+      ir::SsaDef factor = builder.add(ir::Op::FMul(ir::ScalarType::eF32, factorX, factorY));
+      factor = builder.add(ir::Op::CompositeConstruct(pixelType, factor, factor, factor, factor));
+
+      sampleValue = builder.add(ir::Op::FMul(pixelType, sampleValue, factor));
+    }
+
+    // Accumulate pixel value into result
+    ir::SsaDef accumDef = pixelType.isFloatType()
+      ? builder.add(ir::Op::FAdd(pixelType, accumPhi, sampleValue))
+      : builder.add(ir::Op::IAdd(pixelType, accumPhi, sampleValue));
+
+    // Increment loop counter and exit loop if necessary
+    ir::SsaDef countDef = builder.add(ir::Op::IAdd(ir::ScalarType::eI32, countPhi, builder.makeConstant(1)));
+    ir::SsaDef loopCond = builder.add(ir::Op::SLt(ir::ScalarType::eBool, countDef, builder.makeConstant(loopIterCount)));
+    builder.add(ir::Op::BranchConditional(loopCond, continueBlock, mergeBlock));
+
+    // Rewrite phis and export the final pixel value
+    builder.setCursor(mergeBlock);
+
+    builder.rewriteOp(countPhi, countOp.addPhi(continueBlock, countDef));
+    builder.rewriteOp(accumPhi, accumOp.addPhi(continueBlock, accumDef));
+
+    ir::SsaDef result = helper.emitFormatVector(builder, key.dstFormat, accumDef);
+
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      helper.exportBuiltIn(builder, ir::BuiltIn::eDepth, result);
+    else
+      helper.exportOutput(builder, 0u, result, "color");
+
+    return helper.buildShader(builder);
+  }
+
+
+  DxvkMetaBlit DxvkMetaBlitObjects::createPipeline(const DxvkMetaBlit::Key& key) {
+    DxvkMetaBlit result = { };
+    result.layout = createPipelineLayout();
+
+    auto formatInfo = lookupFormatInfo(key.dstFormat);
+
+    VkImageAspectFlagBits aspect = VkImageAspectFlagBits(
+      formatInfo->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT));
+
+    auto vsSpirv = createVs(key, aspect, result.layout);
+    auto psSpirv = (key.srcSamples == VK_SAMPLE_COUNT_1_BIT)
+      ? createPsSimple(key, aspect, result.layout)
+      : (key.resolveMode == DxvkMetaBlitResolveMode::ResolveAverage
+        ? createPsResolve(key, aspect, result.layout)
+        : createPsSampleMs(key, aspect, result.layout));
+
+    util::DxvkBuiltInGraphicsState state = { };
+    state.vs = vsSpirv;
+    state.fs = psSpirv;
+    state.sampleCount = key.dstSamples;
+    state.colorFormats[0] = aspect == VK_IMAGE_ASPECT_COLOR_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
+    state.depthFormat = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
+
+    result.pipeline = m_device->createBuiltInGraphicsPipeline(result.layout, state);
     return result;
   }
-  
+
+
+  std::string DxvkMetaBlitObjects::getName(const DxvkMetaBlit::Key& key, const char* type) {
+    std::stringstream name;
+    name << "meta_" << type << "_blit";
+    name << "_" << str::format(key.srcViewType).substr(std::strlen("VK_IMAGE_VIEW_TYPE_"));
+    name << "_" << str::format(key.dstFormat).substr(std::strlen("VK_FORMAT_"));
+
+    if (key.dstSamples > VK_SAMPLE_COUNT_1_BIT)
+      name << "_msx" << uint32_t(key.dstSamples);
+
+    if (key.srcSamples > VK_SAMPLE_COUNT_1_BIT) {
+      name << "_msx" << uint32_t(key.srcSamples);
+
+      switch (key.resolveMode) {
+        case DxvkMetaBlitResolveMode::FilterNearest:  name << "_nearest"; break;
+        case DxvkMetaBlitResolveMode::FilterLinear:   name << "_linear"; break;
+        case DxvkMetaBlitResolveMode::ResolveAverage: name << "_resolve"; break;
+      }
+    }
+
+    return str::tolower(name.str());
+  }
+
 }

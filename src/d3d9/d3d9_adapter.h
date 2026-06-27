@@ -7,6 +7,8 @@
 
 #include "../dxvk/dxvk_adapter.h"
 
+#include "../wsi/wsi_monitor.h"
+
 namespace dxvk {
 
   class D3D9InterfaceEx;
@@ -17,6 +19,8 @@ namespace dxvk {
 
     D3D9Adapter(
             D3D9InterfaceEx* pParent,
+      const D3D9ON12_ARGS*   p9On12Args,
+            Rc<DxvkInstance> Instance,
             Rc<DxvkAdapter>  Adapter,
             UINT             Ordinal,
             UINT             DisplayIndex);
@@ -79,15 +83,58 @@ namespace dxvk {
 
     Rc<DxvkAdapter> GetDXVKAdapter() { return m_adapter; }
 
+    uint32_t GetVendorId() const {
+      return m_vendorId;
+    }
+
     D3D9_VK_FORMAT_MAPPING GetFormatMapping(D3D9Format Format) const {
-      return m_d3d9Formats.GetFormatMapping(Format);
+      return m_d3d9Formats->GetFormatMapping(Format);
     }
 
     const DxvkFormatInfo* GetUnsupportedFormatInfo(D3D9Format Format) const {
-      return m_d3d9Formats.GetUnsupportedFormatInfo(Format);
+      return m_d3d9Formats->GetUnsupportedFormatInfo(Format);
+    }
+
+    D3D9ON12_ARGS Get9On12Args() const {
+      return m_9On12Args;
+    }
+
+    void RefreshFormatsTable() const;
+
+    bool IsExtended() const;
+
+    bool IsD3D8Compatible() const;
+
+    force_inline void incRef() {
+      m_refCount.fetch_add(1u, std::memory_order_acquire);
+    }
+
+    force_inline void decRef() {
+      if (m_refCount.fetch_sub(1u, std::memory_order_acquire) == 1u)
+        delete this;
     }
 
   private:
+
+    // used as a global filter when mode count compatibility is enabled
+    inline bool IsCountCompatibleMode(const wsi::WsiMode& wsiMode) {
+      if (wsiMode.refreshRate.numerator / wsiMode.refreshRate.denominator != 60)
+        return false;
+
+      return (wsiMode.width == 640  && wsiMode.height == 480)
+          || (wsiMode.width == 800  && wsiMode.height == 600)
+          || (wsiMode.width == 1024 && wsiMode.height == 768)
+          || (wsiMode.width == 1280 && wsiMode.height == 1024)
+          || (wsiMode.width == 1280 && wsiMode.height == 720)
+          || (wsiMode.width == 1920 && wsiMode.height == 1080);
+    }
+
+    inline bool IsEquivalentMode(const wsi::WsiMode& wsiModeA, const wsi::WsiMode& wsiModeB) {
+      return wsiModeA.width  == wsiModeB.width  &&
+             wsiModeA.height == wsiModeB.height &&
+             (wsiModeA.refreshRate.numerator / wsiModeA.refreshRate.denominator ==
+              wsiModeB.refreshRate.numerator / wsiModeB.refreshRate.denominator);
+    }
 
     HRESULT CheckDeviceVkFormat(
           VkFormat        Format,
@@ -96,16 +143,33 @@ namespace dxvk {
 
     void CacheModes(D3D9Format Format);
 
+    void FilterModesByFormat(
+          D3D9Format Format,
+          const bool ApplyOptionsFilter);
+
+    void CacheIdentifierInfo();
+
+    std::atomic<uint32_t>         m_refCount = { 0u };
+
     D3D9InterfaceEx*              m_parent;
 
     Rc<DxvkAdapter>               m_adapter;
+    DxvkDeviceCapabilities        m_caps;
+
     UINT                          m_ordinal;
     UINT                          m_displayIndex;
 
-    std::vector<D3DDISPLAYMODEEX> m_modes;
-    D3D9Format                    m_modeCacheFormat;
+    GUID                          m_deviceGuid;
+    uint32_t                      m_vendorId;
+    uint32_t                      m_deviceId;
+    std::string                   m_deviceDesc;
+    std::string                   m_deviceDriver;
+    D3D9ON12_ARGS                 m_9On12Args = { };
 
-    const D3D9VkFormatTable       m_d3d9Formats;
+    std::vector<D3DDISPLAYMODEEX>            m_modes;
+    D3D9Format                               m_modeCacheFormat;
+
+    std::unique_ptr<D3D9VkFormatTable>       m_d3d9Formats;
 
   };
 

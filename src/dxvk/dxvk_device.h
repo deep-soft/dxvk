@@ -5,11 +5,11 @@
 #include "dxvk_compute.h"
 #include "dxvk_constant_state.h"
 #include "dxvk_context.h"
-#include "dxvk_extensions.h"
 #include "dxvk_fence.h"
 #include "dxvk_framebuffer.h"
 #include "dxvk_image.h"
 #include "dxvk_instance.h"
+#include "dxvk_latency.h"
 #include "dxvk_memory.h"
 #include "dxvk_meta_clear.h"
 #include "dxvk_objects.h"
@@ -24,26 +24,28 @@
 #include "dxvk_sparse.h"
 #include "dxvk_stats.h"
 #include "dxvk_unbound.h"
-#include "dxvk_marker.h"
 
 namespace dxvk {
   
   class DxvkInstance;
+  class DxvkShaderCache;
 
-  /**
-   * \brief Device options
-   */
-  struct DxvkDeviceOptions {
-    uint32_t maxNumDynamicUniformBuffers = 0;
-    uint32_t maxNumDynamicStorageBuffers = 0;
-  };
+  class DxvkIrShader;
+  class DxvkIrShaderConverter;
+  struct DxvkIrShaderCreateInfo;
 
   /**
    * \brief Device performance hints
    */
   struct DxvkDevicePerfHints {
-    VkBool32 preferFbDepthStencilCopy : 1;
-    VkBool32 preferFbResolve          : 1;
+    VkBool32 preferFbDepthStencilCopy   : 1;
+    VkBool32 renderPassClearFormatBug   : 1;
+    VkBool32 renderPassResolveFormatBug : 1;
+    VkBool32 preferRenderPassOps        : 1;
+    VkBool32 preferPrimaryCmdBufs       : 1;
+    VkBool32 preferComputeMipGen        : 1;
+    VkBool32 preferDescriptorByteOffsets: 1;
+    VkBool32 preferCachedMemory         : 1;
   };
   
   /**
@@ -53,9 +55,11 @@ namespace dxvk {
    * queue family that it belongs to.
    */
   struct DxvkDeviceQueue {
-    VkQueue   queueHandle = VK_NULL_HANDLE;
-    uint32_t  queueFamily = 0;
-    uint32_t  queueIndex  = 0;
+    VkQueue       queueHandle = VK_NULL_HANDLE;
+    uint32_t      queueFamily = 0u;
+    uint32_t      queueIndex  = 0u;
+
+    DxvkDeviceQueueInfo properties = { };
   };
 
   /**
@@ -85,7 +89,7 @@ namespace dxvk {
       const Rc<DxvkInstance>&         instance,
       const Rc<DxvkAdapter>&          adapter,
       const Rc<vk::DeviceFn>&         vkd,
-      const DxvkDeviceFeatures&       features,
+      const DxvkDeviceCapabilities&   caps,
       const DxvkDeviceQueueSet&       queues,
       const DxvkQueueCallback&        queueCallback);
       
@@ -100,11 +104,36 @@ namespace dxvk {
     }
     
     /**
+     * \brief Vulkan instance functions
+     * \returns Vulkan instance functions
+     */
+    Rc<vk::InstanceFn> vki() const {
+      return m_instance->vki();
+    }
+    
+    /**
      * \brief Logical device handle
      * \returns The device handle
      */
     VkDevice handle() const {
       return m_vkd->device();
+    }
+
+    /**
+     * \brief D3DKMT device local handle
+     * \returns The device D3DKMT local handle
+     * \returns \c 0 if there's no matching D3DKMT device
+     */
+    D3DKMT_HANDLE kmtLocal() const {
+      return m_kmtLocal;
+    }
+
+    /**
+     * \brief Checks whether debug functionality is enabled
+     * \returns \c true if debug utils are enabled
+     */
+    DxvkDebugFlags debugFlags() const {
+      return m_debugFlags;
     }
 
     /**
@@ -134,7 +163,18 @@ namespace dxvk {
       return m_queues.transfer.queueHandle
           != m_queues.graphics.queueHandle;
     }
-    
+
+    /**
+     * \brief Queries sharing mode info
+     * \returns Sharing mode info
+     */
+    DxvkSharingModeInfo getSharingMode() const {
+      DxvkSharingModeInfo result = { };
+      result.queueFamilies[0] = m_queues.graphics.queueFamily;
+      result.queueFamilies[1] = m_queues.transfer.queueFamily;
+      return result;
+    }
+
     /**
      * \brief The instance
      * 
@@ -193,6 +233,18 @@ namespace dxvk {
       return m_adapter->getFormatLimits(query);
     }
 
+
+    /**
+     * \brief Queries default shader compile options
+     *
+     * Can be overridden by the client API. Only applies to
+     * shaders using internal IR rather than SPIR-V binaries.
+     * \returns Device-global shader compile options.
+     */
+    DxvkShaderOptions getShaderCompileOptions() const {
+      return m_shaderOptions;
+    }
+
     /**
      * \brief Get device status
      * 
@@ -203,6 +255,19 @@ namespace dxvk {
     VkResult getDeviceStatus() const {
       return m_submissionQueue.getLastError();
     }
+
+    /**
+     * \brief Queries mapped image subresource layout
+     *
+     * Assumes that the image tiling is linear even
+     * if not explcitly set in the create info.
+     * \param [in] createInfo Image create info
+     * \param [in] subresource Subresource to query
+     * \returns Subresource layout
+     */
+    VkSubresourceLayout queryImageSubresourceLayout(
+      const DxvkImageCreateInfo&        createInfo,
+      const VkImageSubresource&         subresource);
 
     /**
      * \brief Checks whether this is a UMA system
@@ -226,10 +291,51 @@ namespace dxvk {
     bool canUsePipelineCacheControl() const;
 
     /**
+     * \brief Checks whether sample locations can be used
+     * \returns \c true if sample locations are supported for any of the given sample counts
+     */
+    bool canUseSampleLocations(VkSampleCountFlags samples) const;
+
+    /**
      * \brief Checks whether pipelines should be tracked
      * \returns \c true if pipelines need to be tracked
      */
     bool mustTrackPipelineLifetime() const;
+
+    /**
+     * \brief Checks whether descriptor heaps can be used
+     * \returns \c true if all required features are supported.
+     */
+    bool canUseDescriptorHeap() const {
+      return m_features.extDescriptorHeap.descriptorHeap;
+    }
+
+    /**
+     * \brief Checks whether descriptor buffers can be used
+     * \returns \c true if all required features are supported.
+     */
+    bool canUseDescriptorBuffer() const {
+      return m_features.extDescriptorBuffer.descriptorBuffer && !canUseDescriptorHeap();
+    }
+
+    /**
+     * \brief Checks whether CUDA interop is enabled
+     *
+     * Relevant for descriptor heap usage since CUDA interop still
+     * needs legacy image view and sampler handles.
+     * \returns \c true if all required features are supported.
+     */
+    bool hasCudaInterop() const {
+      return m_features.nvxImageViewHandle;
+    }
+
+    /**
+     * \brief Queries set layout for spec constant data UBO
+     * \returns Legacy descriptor set layout for spec data
+     */
+    VkDescriptorSetLayout getSpecDataSetLayout() {
+      return m_objects.pipelineManager().getSpecDataSetLayout();
+    }
 
     /**
      * \brief Queries default framebuffer size
@@ -242,12 +348,6 @@ namespace dxvk {
      * \returns Supported shader pipeline stages
      */
     VkPipelineStageFlags getShaderPipelineStages() const;
-    
-    /**
-     * \brief Retrieves device options
-     * \returns Device options
-     */
-    DxvkDeviceOptions options() const;
 
     /**
      * \brief Retrieves performance hints
@@ -268,16 +368,15 @@ namespace dxvk {
      * 
      * Creates a context object that can
      * be used to record command buffers.
-     * \param [in] type Context type
      * \returns The context object
      */
-    Rc<DxvkContext> createContext(DxvkContextType type);
+    Rc<DxvkContext> createContext();
 
     /**
      * \brief Creates a GPU event
      * \returns New GPU event
      */
-    Rc<DxvkGpuEvent> createGpuEvent();
+    Rc<DxvkEvent> createGpuEvent();
 
     /**
      * \brief Creates a query
@@ -287,11 +386,20 @@ namespace dxvk {
      * \param [in] index Query index
      * \returns New query
      */
-    Rc<DxvkGpuQuery> createGpuQuery(
+    Rc<DxvkQuery> createGpuQuery(
             VkQueryType           type,
             VkQueryControlFlags   flags,
             uint32_t              index);
-    
+
+    /**
+     * \brief Creates a raw GPU query
+     *
+     * \param [in] type Query type
+     * \returns New query
+     */
+    Rc<DxvkGpuQuery> createRawQuery(
+            VkQueryType           type);
+
     /**
      * \brief Creates new fence
      *
@@ -322,17 +430,6 @@ namespace dxvk {
     Rc<DxvkImage> createImage(
       const DxvkImageCreateInfo&  createInfo,
             VkMemoryPropertyFlags memoryType);
-
-    /**
-     * \brief Creates an image view
-     * 
-     * \param [in] image The image to create a view for
-     * \param [in] createInfo Image view create info
-     * \returns The image view
-     */
-    Rc<DxvkImageView> createImageView(
-      const Rc<DxvkImage>&            image,
-      const DxvkImageViewCreateInfo&  createInfo);
     
     /**
      * \brief Creates a sampler object
@@ -341,7 +438,7 @@ namespace dxvk {
      * \returns Newly created sampler object
      */
     Rc<DxvkSampler> createSampler(
-      const DxvkSamplerCreateInfo&  createInfo);
+      const DxvkSamplerKey&         createInfo);
 
     /**
      * \brief Creates local allocation cache
@@ -359,6 +456,59 @@ namespace dxvk {
      * \returns Sparse page allocator
      */
     Rc<DxvkSparsePageAllocator> createSparsePageAllocator();
+
+    /**
+     * \brief Creates built-in pipeline layout
+     *
+     * \param [in] flags Pipeline layout flags
+     * \param [in] pushDataStages Push data stage mask
+     * \param [in] pushDataSize Push data size
+     * \param [in] bindingCount Number of resource bindings
+     * \param [in] bindings Resource bindings
+     * \returns Unique pipeline layout
+     */
+    const DxvkPipelineLayout* createBuiltInPipelineLayout(
+            DxvkPipelineLayoutFlags         flags,
+            VkShaderStageFlags              pushDataStages,
+            VkDeviceSize                    pushDataSize,
+            uint32_t                        bindingCount,
+      const DxvkDescriptorSetLayoutBinding* bindings);
+
+    /**
+     * \brief Creates built-in compute pipeline
+     *
+     * \param [in] layout Pipeline layout
+     * \param [in] stage Shader stage info
+     */
+    VkPipeline createBuiltInComputePipeline(
+      const DxvkPipelineLayout*             layout,
+      const util::DxvkBuiltInShaderStage&   stage);
+
+    /**
+     * \brief Creates built-in graphics pipeline
+     *
+     * \param [in] layout Pipeline layout
+     * \param [in] state Pipeline state
+     */
+    VkPipeline createBuiltInGraphicsPipeline(
+      const DxvkPipelineLayout*             layout,
+      const util::DxvkBuiltInGraphicsState& state);
+
+    /**
+     * \brief Creates IR shader from cache
+     *
+     * Will try to look up and retrive the given shader from
+     * the shader cache. If no shader converter is provided
+     * and the look-up fails, this returns \c nullptr.
+     * \param [in] name Shader name
+     * \param [in] createInfo Shader create info
+     * \param [in] converter Shader converter to
+     *    use when cache look-upo fails.
+     */
+    Rc<DxvkShader> createCachedShader(
+      const std::string&                    name,
+      const DxvkIrShaderCreateInfo&         createInfo,
+      const Rc<DxvkIrShaderConverter>&      converter);
 
     /**
      * \brief Imports a buffer
@@ -413,6 +563,39 @@ namespace dxvk {
     DxvkSharedAllocationCacheStats getMemoryAllocationStats(DxvkMemoryAllocationStats& stats);
 
     /**
+     * \brief Queries descriptor properties
+     *
+     * And null descriptors.
+     */
+    const DxvkDescriptorProperties& getDescriptorProperties() {
+      return m_objects.descriptors();
+    }
+
+    /**
+     * \brief Queries sampler statistics
+     * \returns Sampler stats
+     */
+    DxvkSamplerStats getSamplerStats() {
+      return m_objects.samplerPool().getStats();
+    }
+
+    /**
+     * \brief Queries sampler descriptor set
+     * \returns Global sampler set and layout
+     */
+    DxvkSamplerDescriptorSet getSamplerDescriptorSet() {
+      return m_objects.samplerPool().getDescriptorSetInfo();
+    }
+
+    /**
+     * \brief Queries sampler descriptor set
+     * \returns Global sampler set and layout
+     */
+    DxvkDescriptorHeapBindingInfo getSamplerDescriptorHeap() {
+      return m_objects.samplerPool().getDescriptorHeapInfo();
+    }
+
+    /**
      * \brief Retreves current frame ID
      * \returns Current frame ID
      */
@@ -447,19 +630,29 @@ namespace dxvk {
       const Rc<DxvkShader>&         shader);
 
     /**
+     * \brief Creates latency tracker for a presenter
+     *
+     * The specicfic implementation and parameters used
+     * depend on user configuration.
+     * \param [in] presenter Presenter instance
+     */
+    Rc<DxvkLatencyTracker> createLatencyTracker(
+      const Rc<Presenter>&            presenter);
+
+    /**
      * \brief Presents a swap chain image
      * 
      * Invokes the presenter's \c presentImage method on
      * the submission thread. The status of this operation
      * can be retrieved with \ref waitForSubmission.
      * \param [in] presenter The presenter
-     * \param [in] presenteMode Present mode
-     * \param [in] frameId Optional frame ID
+     * \param [in] tracker Latency tracker
+     * \param [in] frameId Frame ID
      * \param [out] status Present status
      */
     void presentImage(
       const Rc<Presenter>&            presenter,
-            VkPresentModeKHR          presentMode,
+      const Rc<DxvkLatencyTracker>&   tracker,
             uint64_t                  frameId,
             DxvkSubmitStatus*         status);
     
@@ -469,10 +662,14 @@ namespace dxvk {
      * Submits the given command list to the device using
      * the given set of optional synchronization primitives.
      * \param [in] commandList The command list to submit
+     * \param [in] tracker Latency tracker
+     * \param [in] frameId Frame ID
      * \param [out] status Submission feedback
      */
     void submitCommandList(
       const Rc<DxvkCommandList>&      commandList,
+      const Rc<DxvkLatencyTracker>&   tracker,
+            uint64_t                  frameId,
             DxvkSubmitStatus*         status);
 
     /**
@@ -517,12 +714,23 @@ namespace dxvk {
     VkResult waitForSubmission(DxvkSubmitStatus* status);
 
     /**
+     * \brief Waits for a fence to become signaled
+     *
+     * Treats the fence wait as a GPU sync point, which can
+     * be useful for device statistics. Should only be used
+     * if rendering is stalled because of this wait.
+     * \param [in] fence Fence to wait on
+     * \param [in] value Fence value
+     */
+    void waitForFence(sync::Fence& fence, uint64_t value);
+
+    /**
      * \brief Waits for resource to become idle
      *
      * \param [in] resource Resource to wait for
      * \param [in] access Access mode to check
      */
-    void waitForResource(const Rc<DxvkResource>& resource, DxvkAccess access);
+    void waitForResource(const DxvkPagedResource& resource, DxvkAccess access);
     
     /**
      * \brief Waits until the device becomes idle
@@ -541,26 +749,36 @@ namespace dxvk {
     Rc<DxvkInstance>            m_instance;
     Rc<DxvkAdapter>             m_adapter;
     Rc<vk::DeviceFn>            m_vkd;
+    D3DKMT_HANDLE               m_kmtLocal = 0;
+
+    DxvkDebugFlags              m_debugFlags;
+    DxvkDeviceQueueSet          m_queues;
 
     DxvkDeviceFeatures          m_features;
     DxvkDeviceInfo              m_properties;
-    
+
+    DxvkShaderOptions           m_shaderOptions;
+
     DxvkDevicePerfHints         m_perfHints;
     DxvkObjects                 m_objects;
 
     sync::Spinlock              m_statLock;
     DxvkStatCounters            m_statCounters;
-    
-    DxvkDeviceQueueSet          m_queues;
-    
+
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
-    
+
     DxvkSubmissionQueue         m_submissionQueue;
 
+    Rc<DxvkShaderCache>         m_shaderCache;
+
     DxvkDevicePerfHints getPerfHints();
-    
+
     void recycleCommandList(
       const Rc<DxvkCommandList>& cmdList);
+
+    void determineShaderOptions();
+
+    void logBindingModel();
 
   };
   
